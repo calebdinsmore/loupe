@@ -176,8 +176,18 @@ export default function App() {
     const ws = new WebSocket(`${proto}://${location.host}/api/reviews/${id}/ws`)
     ws.onmessage = (e) => {
       const ev = JSON.parse(e.data) as AgentEvent
-      setEvents((prev) => [...prev, ev])
       if (ev.type === 'result' || ev.type === 'error') setRunning(false)
+      setEvents((prev) => {
+        // The terminal 'result' event repeats the agent's final assistant text.
+        // Render it only when it carries something new (e.g. it's the sole
+        // source of the summary) so the closing message never shows twice.
+        if (ev.type === 'result') {
+          const text = (ev.text ?? '').trim()
+          const prevText = (prev[prev.length - 1]?.text ?? '').trim()
+          if (!text || text === prevText) return prev
+        }
+        return [...prev, ev]
+      })
     }
     ws.onclose = () => setRunning(false)
   }
