@@ -1,0 +1,11 @@
+# build output
+/loupe
+
+# per-repo loupe data (created at runtime)
+/.loupe/
+
+# frontend deps + build artifacts (web_dist/index.html placeholder is tracked)
+/web/node_modules/
+/internal/server/web_dist/assets/
+
+.DS_Store
