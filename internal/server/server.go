@@ -33,8 +33,14 @@ func New(g *git.Service, st *store.Store, r *agent.Runner) *Server {
 	m := chi.NewRouter()
 	m.Get("/api/branches", s.handleBranches)
 	m.Get("/api/diff", s.handleDiff)
-	m.Post("/api/reviews", s.handleCreateReview)
+	m.Get("/api/reviews", s.handleListReviews)
+	m.Post("/api/reviews", s.handleEnsureReview)
+	m.Get("/api/reviews/{id}/comments", s.handleListComments)
+	m.Post("/api/reviews/{id}/comments", s.handleAddComment)
+	m.Post("/api/reviews/{id}/submit", s.handleSubmitReview)
 	m.Get("/api/reviews/{id}/ws", s.handleWS)
+	m.Patch("/api/comments/{id}", s.handleUpdateComment)
+	m.Delete("/api/comments/{id}", s.handleDeleteComment)
 	m.Handle("/*", spaHandler())
 	s.mux = m
 	return s
@@ -69,44 +75,179 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"diff": diff})
 }
 
-type createReviewReq struct {
-	Branch   string          `json:"branch"`
-	Base     string          `json:"base"`
-	Mode     string          `json:"mode"`
+// reviewJSON is a review plus its comments, used to hydrate the frontend on load.
+type reviewJSON struct {
+	store.Review
 	Comments []store.Comment `json:"comments"`
 }
 
-func (s *Server) handleCreateReview(w http.ResponseWriter, r *http.Request) {
-	var req createReviewReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	id, err := s.store.CreateReview(req.Branch, req.Base, req.Mode)
+// handleListReviews returns stored reviews (optionally filtered by ?branch=&base=),
+// each with its comments embedded so the frontend can restore state in one call.
+func (s *Server) handleListReviews(w http.ResponseWriter, r *http.Request) {
+	branch := r.URL.Query().Get("branch")
+	base := r.URL.Query().Get("base")
+	reviews, err := s.store.Reviews(branch, base)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	for _, c := range req.Comments {
-		c.ReviewID = id
-		_ = s.store.AddComment(c)
+	out := make([]reviewJSON, 0, len(reviews))
+	for _, rev := range reviews {
+		comments, err := s.store.Comments(rev.ID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out = append(out, reviewJSON{Review: rev, Comments: comments})
 	}
-	go s.runReview(id)
+	writeJSON(w, map[string]any{"reviews": out})
+}
+
+type ensureReviewReq struct {
+	Branch string `json:"branch"`
+	Base   string `json:"base"`
+	Mode   string `json:"mode"`
+}
+
+// handleEnsureReview returns the id of the review for a branch/base pair, creating
+// a draft one if needed. It does not run the agent — that happens on submit.
+func (s *Server) handleEnsureReview(w http.ResponseWriter, r *http.Request) {
+	var req ensureReviewReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Branch == "" || req.Base == "" {
+		http.Error(w, "branch and base are required", http.StatusBadRequest)
+		return
+	}
+	mode := req.Mode
+	if mode == "" {
+		mode = string(adapter.ModeDocument)
+	}
+	id, err := s.store.EnsureReview(req.Branch, req.Base, mode)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]int64{"id": id})
 }
 
-// runReview builds the prompt, runs the agent, and fans events out to the hub.
-func (s *Server) runReview(id int64) {
+func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	comments, err := s.store.Comments(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"comments": comments})
+}
+
+func (s *Server) handleAddComment(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	var c store.Comment
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	c.ReviewID = id
+	newID, err := s.store.AddComment(c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	c.ID = newID
+	writeJSON(w, c)
+}
+
+// updateCommentReq carries partial edits; nil fields are left unchanged.
+type updateCommentReq struct {
+	Body      *string `json:"body"`
+	Submitted *bool   `json:"submitted"`
+	Collapsed *bool   `json:"collapsed"`
+}
+
+func (s *Server) handleUpdateComment(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	var req updateCommentReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	c, err := s.store.CommentByID(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if req.Body != nil {
+		c.Body = *req.Body
+	}
+	if req.Submitted != nil {
+		c.Submitted = *req.Submitted
+	}
+	if req.Collapsed != nil {
+		c.Collapsed = *req.Collapsed
+	}
+	if err := s.store.UpdateComment(id, c.Body, c.Submitted, c.Collapsed); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, c)
+}
+
+func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err := s.store.DeleteComment(id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type submitReviewReq struct {
+	Mode string `json:"mode"`
+}
+
+// handleSubmitReview marks the review's pending comments as submitted and kicks
+// off the agent run on that batch.
+func (s *Server) handleSubmitReview(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	var req submitReviewReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Mode != "" {
+		if err := s.store.SetMode(id, req.Mode); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	batch, err := s.store.MarkSubmitted(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(batch) == 0 {
+		http.Error(w, "no pending comments to submit", http.StatusBadRequest)
+		return
+	}
+	go s.runReview(id, batch)
+	writeJSON(w, map[string]any{"id": id})
+}
+
+// runReview builds the prompt from the just-submitted batch, runs the agent, and
+// fans events out to the hub.
+func (s *Server) runReview(id int64, batch []store.Comment) {
 	h := s.hubFor(id)
 	rev, err := s.store.Review(id)
 	if err != nil {
 		h.broadcast(agent.Event{Type: agent.EventError, Text: err.Error()})
 		return
 	}
-	comments, _ := s.store.Comments(id)
 	diff, _ := s.git.Diff(rev.Base, rev.Branch)
 
-	prompt := adapter.BuildPrompt(rev, comments, diff)
+	prompt := adapter.BuildPrompt(rev, batch, diff)
 	tools := adapter.AllowedTools(adapter.Mode(rev.Mode))
 
 	_ = s.store.SetStatus(id, "running")

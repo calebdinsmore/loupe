@@ -1,5 +1,14 @@
 import { Fragment, useEffect, useState } from 'react'
-import { getBranches, getDiff, submitReview } from './api'
+import {
+  addComment,
+  deleteComment as apiDeleteComment,
+  ensureReview,
+  getBranches,
+  getDiff,
+  listReviews,
+  submitReview,
+  updateComment,
+} from './api'
 import { parseUnifiedDiff, type DiffLine, type FileDiff } from './diff'
 import { highlightLine, langForPath } from './highlight'
 import 'highlight.js/styles/github-dark.css'
@@ -13,7 +22,7 @@ interface AgentEvent {
 }
 
 interface Comment {
-  id: string
+  id: number
   path: string
   line: number
   side: string
@@ -27,7 +36,7 @@ interface Editor {
   path: string
   line: number
   side: string
-  id?: string
+  id?: number
 }
 
 const rowId = (path: string, line: number) => `loc-${path.replace(/[^a-zA-Z0-9]/g, '_')}-${line}`
@@ -38,6 +47,7 @@ export default function App() {
   const [branch, setBranch] = useState('')
   const [files, setFiles] = useState<FileDiff[]>([])
   const [comments, setComments] = useState<Comment[]>([])
+  const [reviewId, setReviewId] = useState<number | null>(null)
   const [editor, setEditor] = useState<Editor | null>(null)
   const [draft, setDraft] = useState('')
   const [mode, setMode] = useState<Mode>('document')
@@ -54,8 +64,35 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (base && branch && base !== branch) {
-      getDiff(base, branch).then((raw) => setFiles(parseUnifiedDiff(raw)))
+    if (!(base && branch && base !== branch)) return
+    let cancelled = false
+    getDiff(base, branch).then((raw) => {
+      if (!cancelled) setFiles(parseUnifiedDiff(raw))
+    })
+    // Reattach to the persisted review for this pair so submitted comments
+    // reappear (collapsed/resolved) after a reload.
+    setReviewId(null)
+    setComments([])
+    ;(async () => {
+      const id = await ensureReview(base, branch)
+      if (cancelled) return
+      setReviewId(id)
+      const reviews = await listReviews(base, branch)
+      if (cancelled) return
+      const rev = reviews.find((r) => r.ID === id)
+      const hydrated = (rev?.comments ?? []).map((c) => ({
+        id: c.id,
+        path: c.path,
+        line: c.line,
+        side: c.side,
+        body: c.body,
+        submitted: c.submitted,
+        collapsed: c.collapsed,
+      }))
+      setComments(hydrated)
+    })()
+    return () => {
+      cancelled = true
     }
   }, [base, branch])
 
@@ -73,33 +110,50 @@ export default function App() {
     jumpTo(c.path, c.line)
   }
 
-  function saveEditor() {
+  // ensureReviewId returns the persisted review id for the current pair, creating
+  // a draft one the first time a comment is added.
+  async function ensureReviewId(): Promise<number> {
+    if (reviewId != null) return reviewId
+    const id = await ensureReview(base, branch)
+    setReviewId(id)
+    return id
+  }
+
+  async function saveEditor() {
     if (!editor) return
     const body = draft.trim()
-    if (body) {
-      if (editor.id) {
-        // Editing reopens a comment so the next submission re-sends it.
-        setComments((cs) =>
-          cs.map((c) => (c.id === editor.id ? { ...c, body, submitted: false, collapsed: false } : c)),
-        )
-      } else {
-        setComments((cs) => [
-          ...cs,
-          { id: crypto.randomUUID(), path: editor.path, line: editor.line, side: editor.side, body, submitted: false, collapsed: false },
-        ])
-      }
-    }
+    const target = editor
     setEditor(null)
     setDraft('')
+    if (!body) return
+    if (target.id != null) {
+      // Editing reopens a comment so the next submission re-sends it.
+      await updateComment(target.id, { body, submitted: false, collapsed: false })
+      setComments((cs) =>
+        cs.map((c) => (c.id === target.id ? { ...c, body, submitted: false, collapsed: false } : c)),
+      )
+    } else {
+      const id = await ensureReviewId()
+      const created = await addComment(id, { path: target.path, side: target.side, line: target.line, body })
+      setComments((cs) => [
+        ...cs,
+        { id: created.id, path: created.path, line: created.line, side: created.side, body: created.body, submitted: created.submitted, collapsed: created.collapsed },
+      ])
+    }
   }
 
-  function deleteComment(id: string) {
-    setComments((cs) => cs.filter((c) => c.id !== id))
+  async function deleteComment(id: number) {
     if (editor?.id === id) setEditor(null)
+    await apiDeleteComment(id)
+    setComments((cs) => cs.filter((c) => c.id !== id))
   }
 
-  function toggleCollapse(id: string) {
-    setComments((cs) => cs.map((c) => (c.id === id ? { ...c, collapsed: !c.collapsed } : c)))
+  async function toggleCollapse(id: number) {
+    const current = comments.find((c) => c.id === id)
+    if (!current) return
+    const collapsed = !current.collapsed
+    await updateComment(id, { collapsed })
+    setComments((cs) => cs.map((c) => (c.id === id ? { ...c, collapsed } : c)))
   }
 
   function jumpTo(path: string, line: number) {
@@ -113,13 +167,10 @@ export default function App() {
     if (running || !pending.length) return
     setRunning(true)
     setEvents([])
-    const id = await submitReview({
-      base,
-      branch,
-      mode,
-      comments: pending.map(({ path, side, line, body }) => ({ path, side, line, body })),
-    })
-    // Mark everything we just sent as submitted + resolved so it won't resend.
+    const id = await ensureReviewId()
+    await submitReview(id, mode)
+    // The server marked the pending batch submitted + collapsed; mirror that
+    // locally so the UI resolves them and the submit button gates correctly.
     setComments((cs) => cs.map((c) => (c.submitted ? c : { ...c, submitted: true, collapsed: true })))
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
     const ws = new WebSocket(`${proto}://${location.host}/api/reviews/${id}/ws`)
