@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS comments (
   submitted  INTEGER NOT NULL DEFAULT 0,
   collapsed  INTEGER NOT NULL DEFAULT 0,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );`
 
 // migrations add columns to databases created before those columns existed.
@@ -247,5 +251,23 @@ func (s *Store) SetStatus(id int64, status string) error {
 
 func (s *Store) SetSession(id int64, session string) error {
 	_, err := s.db.Exec(`UPDATE reviews SET session_id = ? WHERE id = ?`, session, id)
+	return err
+}
+
+// Setting returns the stored value for key, or "" if unset.
+func (s *Store) Setting(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+// SetSetting upserts a settings value.
+func (s *Store) SetSetting(key, value string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
 }
