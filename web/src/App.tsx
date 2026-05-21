@@ -16,6 +16,12 @@ import 'highlight.js/styles/github-dark.css'
 
 type Mode = 'beads' | 'document' | 'direct'
 
+// WORKING_REF mirrors git.WorkingRef: a sentinel "branch" that selects the
+// working tree (committed + uncommitted changes) instead of a real branch. It
+// flows through the existing base/branch UI, persistence key, and WebSocket
+// untouched, so no API shape changes are needed.
+const WORKING_REF = '*working*'
+
 interface Comment {
   id: number
   path: string
@@ -49,6 +55,10 @@ export default function App() {
   const [events, setEvents] = useState<AgentEvent[]>([])
   const [running, setRunning] = useState(false)
   const [flash, setFlash] = useState<string | null>(null)
+  // Bumped by the Refresh button to re-pull the diff. Working-tree diffs are
+  // live, so unlike committed branch diffs they can change without base/branch
+  // changing.
+  const [refreshKey, setRefreshKey] = useState(0)
 
   useEffect(() => {
     getBranches().then((info) => {
@@ -58,12 +68,22 @@ export default function App() {
     })
   }, [])
 
+  // Pull the diff. Separate from review hydration so the Refresh button can
+  // re-pull a live working-tree diff without resetting comment state.
   useEffect(() => {
     if (!(base && branch && base !== branch)) return
     let cancelled = false
     getDiff(base, branch).then((raw) => {
       if (!cancelled) setFiles(parseUnifiedDiff(raw))
     })
+    return () => {
+      cancelled = true
+    }
+  }, [base, branch, refreshKey])
+
+  useEffect(() => {
+    if (!(base && branch && base !== branch)) return
+    let cancelled = false
     // Reattach to the persisted review for this pair so submitted comments
     // reappear (collapsed/resolved) after a reload.
     setReviewId(null)
@@ -217,9 +237,18 @@ export default function App() {
             branch
             <select value={branch} onChange={(e) => setBranch(e.target.value)}>
               <option value="">select…</option>
+              <option value={WORKING_REF}>Working tree (uncommitted)</option>
               {branches.map((b) => <option key={b}>{b}</option>)}
             </select>
           </label>
+          <button
+            className="refresh"
+            onClick={() => setRefreshKey((k) => k + 1)}
+            disabled={!(base && branch && base !== branch)}
+            title="Re-pull the diff (working-tree diffs are live)"
+          >
+            Refresh diff
+          </button>
         </div>
       </header>
 

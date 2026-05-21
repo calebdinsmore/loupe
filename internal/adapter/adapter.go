@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/calebjdinsmore/loupe/internal/git"
 	"github.com/calebjdinsmore/loupe/internal/store"
 )
 
@@ -52,7 +53,11 @@ func instruction(m Mode, reviewID int64) string {
 // BuildPrompt assembles the full payload handed to the agent.
 func BuildPrompt(r store.Review, comments []store.Comment, diff string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "You are addressing a code review on branch `%s` (base `%s`).\n\n", r.Branch, r.Base)
+	if r.Branch == git.WorkingRef {
+		fmt.Fprintf(&b, "You are addressing a code review of the uncommitted working-tree changes against base `%s` (committed + uncommitted changes together).\n\n", r.Base)
+	} else {
+		fmt.Fprintf(&b, "You are addressing a code review on branch `%s` (base `%s`).\n\n", r.Branch, r.Base)
+	}
 
 	b.WriteString("## Reviewer comments\n\n")
 	for _, c := range comments {

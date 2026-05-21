@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -153,3 +156,65 @@ func TestListReviewsEmbedsComments(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// TestDiffWorkingRefRoutesToWorkingTree verifies the working-tree sentinel
+// routes /api/diff to DiffWorking: requesting branch=*working* surfaces an
+// uncommitted edit that the committed branch diff does not.
+func TestDiffWorkingRefRoutesToWorkingTree(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	write("file.txt", "base line\n")
+	runGit("add", "file.txt")
+	runGit("commit", "-m", "base")
+	// Uncommitted edit in the working tree on main.
+	write("file.txt", "base line\nuncommitted line\n")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(git.New(dir), st, agent.New(dir))
+
+	diffOf := func(branch string) string {
+		t.Helper()
+		target := "/api/diff?base=main&branch=" + url.QueryEscape(branch)
+		w := do(t, srv, http.MethodGet, target, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("diff %s = %d (%s)", branch, w.Code, w.Body.String())
+		}
+		var out struct {
+			Diff string `json:"diff"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode diff: %v", err)
+		}
+		return out.Diff
+	}
+
+	// The committed diff of main against itself is empty (no uncommitted view).
+	if got := diffOf("main"); strings.Contains(got, "uncommitted line") {
+		t.Fatalf("committed diff unexpectedly contains the uncommitted edit:\n%s", got)
+	}
+	// The sentinel routes to DiffWorking, which surfaces the uncommitted edit.
+	if got := diffOf(git.WorkingRef); !strings.Contains(got, "uncommitted line") {
+		t.Fatalf("working-tree diff missing the uncommitted edit:\n%s", got)
+	}
+}
