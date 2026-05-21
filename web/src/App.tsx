@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { FileTree, type FileMeta } from './FileTreePanel'
 import {
   addComment,
@@ -16,6 +16,7 @@ import { relocate } from './anchor'
 import { parseUnifiedDiff, type DiffLine, type FileDiff } from './diff'
 import { appendEvent, type AgentEvent } from './events'
 import { highlightLine, langForPath } from './highlight'
+import { formatClock, minuteBucket } from './timestamps'
 import 'highlight.js/styles/github-dark.css'
 
 // WORKING_REF mirrors git.WorkingRef: a sentinel "branch" that selects the
@@ -62,6 +63,7 @@ export default function App() {
   const [mode, setMode] = useState<string>('document')
   const [prompts, setPrompts] = useState<PromptInfo[]>([])
   const [events, setEvents] = useState<AgentEvent[]>([])
+  const consoleRef = useRef<HTMLDivElement>(null)
   const [running, setRunning] = useState(false)
   const [flash, setFlash] = useState<string | null>(null)
   // Bumped by the Refresh button to re-pull the diff. Working-tree diffs are
@@ -72,6 +74,16 @@ export default function App() {
   // is currently in view (scroll-spy highlight).
   const [treeCollapsed, setTreeCollapsed] = useState(false)
   const [activeFile, setActiveFile] = useState<string | null>(null)
+
+  // Follow new agent output, but only when the user is already near the bottom.
+  // The 80px threshold tolerates the height of the row just appended, so a user
+  // who has scrolled up to read history is not yanked back down.
+  useEffect(() => {
+    const el = consoleRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }, [events])
 
   useEffect(() => {
     getBranches().then((info) => {
@@ -137,6 +149,27 @@ export default function App() {
   const pending = comments.filter((c) => !c.submitted)
 
   const paths = useMemo(() => files.map((f) => f.path), [files])
+
+  // Console rows with timestamp dividers. Walk the events once, tracking the
+  // previous rendered event's minute bucket; flag showTs on the first event with
+  // a ts and whenever output crosses into a new minute. Built as an explicit
+  // loop to avoid closure-over-loop pitfalls in the render.
+  const consoleRows = useMemo(() => {
+    const rows: { event: AgentEvent; showTs: boolean }[] = []
+    let prevBucket: number | null = null
+    for (const event of events) {
+      let showTs = false
+      if (event.ts != null) {
+        const bucket = minuteBucket(event.ts)
+        if (bucket !== prevBucket) {
+          showTs = true
+          prevBucket = bucket
+        }
+      }
+      rows.push({ event, showTs })
+    }
+    return rows
+  }, [events])
 
   // Per-file badge data for the tree: +/- line counts from the diff plus the
   // count of pending comments anchored in each file.
@@ -528,11 +561,16 @@ export default function App() {
           </button>
 
           <h2>Agent</h2>
-          <div className="console">
-            {events.map((ev, i) => (
-              <div key={i} className={`ev ev-${ev.type}`}>
-                {ev.type === 'tool_use' ? `⚙ ${ev.tool}` : ev.text}
-              </div>
+          <div className="console" ref={consoleRef}>
+            {consoleRows.map(({ event: ev, showTs }, i) => (
+              <Fragment key={ev.ts != null ? `${ev.ts}-${i}` : i}>
+                {showTs && ev.ts != null && (
+                  <div className="ev-ts">{formatClock(ev.ts)}</div>
+                )}
+                <div className={`ev ev-${ev.type}`}>
+                  {ev.type === 'tool_use' ? `⚙ ${ev.tool}` : ev.text}
+                </div>
+              </Fragment>
             ))}
           </div>
         </aside>
