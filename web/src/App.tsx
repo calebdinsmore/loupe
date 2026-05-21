@@ -65,6 +65,12 @@ export default function App() {
   const [prompts, setPrompts] = useState<PromptInfo[]>([])
   const [events, setEvents] = useState<AgentEvent[]>([])
   const consoleRef = useRef<HTMLDivElement>(null)
+  // pinnedToBottom tracks whether the console is anchored to its newest output.
+  // It is recomputed on scroll (user scrolling and our own programmatic
+  // scroll-to-bottom both fire onScroll), so it reflects the position BEFORE
+  // new events commit to the DOM. Initialized true so the first events scroll
+  // into view.
+  const pinnedToBottom = useRef(true)
   const [running, setRunning] = useState(false)
   // hasSession gates the message input: a session exists once the first submit
   // has produced one. Hydrated from the persisted review and set true on submit.
@@ -80,15 +86,25 @@ export default function App() {
   const [treeCollapsed, setTreeCollapsed] = useState(false)
   const [activeFile, setActiveFile] = useState<string | null>(null)
 
-  // Follow new agent output, but only when the user is already near the bottom.
-  // The 80px threshold tolerates the height of the row just appended, so a user
-  // who has scrolled up to read history is not yanked back down.
+  // Follow new agent output, but only when the user is already pinned to the
+  // bottom. Stickiness is decided from the pre-update scroll position captured
+  // by onConsoleScroll, not from the post-commit scrollHeight; otherwise a
+  // streamed chunk taller than the threshold would look like the user had
+  // scrolled up and following would stop.
   useEffect(() => {
     const el = consoleRef.current
-    if (!el) return
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
-    if (nearBottom) el.scrollTop = el.scrollHeight
+    if (!el || !pinnedToBottom.current) return
+    el.scrollTop = el.scrollHeight
   }, [events])
+
+  // Recompute whether the console is pinned to the bottom on every scroll. The
+  // 80px tolerance treats "almost at the bottom" as pinned so a small manual
+  // nudge does not detach following.
+  function onConsoleScroll() {
+    const el = consoleRef.current
+    if (!el) return
+    pinnedToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }
 
   // Persistent agent socket: open on review load (not just on submit) so the hub
   // replays the full transcript on reload and live events from both submit and
@@ -597,7 +613,7 @@ export default function App() {
           </button>
 
           <h2>Agent</h2>
-          <div className="console" ref={consoleRef}>
+          <div className="console" ref={consoleRef} onScroll={onConsoleScroll}>
             {consoleRows.map(({ event: ev, showTs }, i) => (
               <Fragment key={ev.ts != null ? `${ev.ts}-${i}` : i}>
                 {showTs && ev.ts != null && (
