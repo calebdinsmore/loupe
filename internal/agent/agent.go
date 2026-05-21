@@ -22,6 +22,7 @@ const (
 	EventTool   EventType = "tool_use" // assistant invoked a tool
 	EventResult EventType = "result"   // terminal summary
 	EventError  EventType = "error"    // spawn/exit failure
+	EventUser   EventType = "user"     // user-authored turn; carries Text
 )
 
 type Event struct {
@@ -29,6 +30,7 @@ type Event struct {
 	Text      string    `json:"text,omitempty"`
 	Tool      string    `json:"tool,omitempty"`
 	SessionID string    `json:"session_id,omitempty"`
+	Ts        int64     `json:"ts,omitempty"` // Unix millis; stamped by the hub on broadcast, not here
 }
 
 // streamLine is the subset of claude's stream-json schema we consume.

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/coder/websocket"
@@ -41,6 +42,7 @@ func New(g *git.Service, st *store.Store, r *agent.Runner, p *prompts.Loader) *S
 	m.Get("/api/reviews/{id}/comments", s.handleListComments)
 	m.Post("/api/reviews/{id}/comments", s.handleAddComment)
 	m.Post("/api/reviews/{id}/submit", s.handleSubmitReview)
+	m.Post("/api/reviews/{id}/message", s.handleSendMessage)
 	m.Get("/api/reviews/{id}/ws", s.handleWS)
 	m.Patch("/api/comments/{id}", s.handleUpdateComment)
 	m.Delete("/api/comments/{id}", s.handleDeleteComment)
@@ -315,16 +317,64 @@ func (s *Server) handleSubmitReview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no pending comments to submit", http.StatusBadRequest)
 		return
 	}
+	// Take the busy slot only after the no-pending check, so an empty submit does
+	// not consume or deny the slot. runAgent releases it via defer h.finish().
+	if !s.hubFor(id).tryStart() {
+		http.Error(w, "agent is busy", http.StatusConflict)
+		return
+	}
 	go s.runReview(id, batch)
 	writeJSON(w, map[string]any{"id": id})
 }
 
-// runReview builds the prompt from the just-submitted batch, runs the agent, and
-// fans events out to the hub.
+type sendMessageReq struct {
+	Text string `json:"text"`
+}
+
+// handleSendMessage spawns a resume agent turn with the user's text as the
+// prompt, broadcasting a user-authored event first so the transcript shows the
+// turn before the reply streams in.
+func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var req sendMessageReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	text := strings.TrimSpace(req.Text)
+	if text == "" {
+		http.Error(w, "empty message", http.StatusBadRequest)
+		return
+	}
+	rev, err := s.store.Review(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if rev.SessionID == "" {
+		http.Error(w, "no agent session yet; submit a review first", http.StatusBadRequest)
+		return
+	}
+	h := s.hubFor(id)
+	if !h.tryStart() {
+		http.Error(w, "agent is busy", http.StatusConflict)
+		return
+	}
+	h.broadcast(agent.Event{Type: agent.EventUser, Text: text})
+	go s.runAgent(id, text, rev.SessionID)
+	writeJSON(w, map[string]any{"id": id})
+}
+
+// runReview builds the prompt from the just-submitted batch, then runs one agent
+// turn via runAgent. The caller (handleSubmitReview) already holds the busy slot.
 func (s *Server) runReview(id int64, batch []store.Comment) {
 	h := s.hubFor(id)
 	rev, err := s.store.Review(id)
 	if err != nil {
+		h.finish()
 		h.broadcast(agent.Event{Type: agent.EventError, Text: err.Error()})
 		return
 	}
@@ -332,15 +382,23 @@ func (s *Server) runReview(id int64, batch []store.Comment) {
 
 	task, err := s.prompts.Render(rev.Mode, prompts.Vars{ReviewID: rev.ID, Branch: rev.Branch, Base: rev.Base})
 	if err != nil {
+		h.finish()
 		h.broadcast(agent.Event{Type: agent.EventError, Text: err.Error()})
 		_ = s.store.SetStatus(id, "error")
 		return
 	}
 	prompt := adapter.BuildPrompt(rev, batch, diff, task)
-	tools := adapter.DefaultTools()
+	s.runAgent(id, prompt, rev.SessionID)
+}
 
+// runAgent runs one agent turn for review id with the given prompt, forwarding
+// events to the hub and persisting session/status. Caller already holds the busy
+// slot; runAgent releases it via defer h.finish().
+func (s *Server) runAgent(id int64, prompt string, resumeID string) {
+	h := s.hubFor(id)
+	defer h.finish()
 	_ = s.store.SetStatus(id, "running")
-	events, err := s.runner.Run(context.Background(), prompt, tools, rev.SessionID)
+	events, err := s.runner.Run(context.Background(), prompt, adapter.DefaultTools(), resumeID)
 	if err != nil {
 		h.broadcast(agent.Event{Type: agent.EventError, Text: err.Error()})
 		_ = s.store.SetStatus(id, "error")
