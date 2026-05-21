@@ -112,6 +112,43 @@ func TestCommentsAndReviewsFiltering(t *testing.T) {
 	}
 }
 
+func TestSettingsRoundTrip(t *testing.T) {
+	s := openTest(t)
+
+	// An unset key returns the empty string with no error.
+	got, err := s.Setting("last_prompt")
+	if err != nil {
+		t.Fatalf("Setting (unset): %v", err)
+	}
+	if got != "" {
+		t.Fatalf("Setting (unset) = %q, want \"\"", got)
+	}
+
+	// SetSetting then Setting round-trips the value.
+	if err := s.SetSetting("last_prompt", "document"); err != nil {
+		t.Fatalf("SetSetting: %v", err)
+	}
+	got, err = s.Setting("last_prompt")
+	if err != nil {
+		t.Fatalf("Setting: %v", err)
+	}
+	if got != "document" {
+		t.Fatalf("Setting = %q, want \"document\"", got)
+	}
+
+	// A second SetSetting on the same key overwrites (upsert) without error.
+	if err := s.SetSetting("last_prompt", "direct"); err != nil {
+		t.Fatalf("SetSetting (overwrite): %v", err)
+	}
+	got, err = s.Setting("last_prompt")
+	if err != nil {
+		t.Fatalf("Setting (after overwrite): %v", err)
+	}
+	if got != "direct" {
+		t.Fatalf("Setting after overwrite = %q, want \"direct\"", got)
+	}
+}
+
 func TestMarkSubmittedReturnsFlaggedRows(t *testing.T) {
 	s := openTest(t)
 	rev, _ := s.CreateReview("feat", "main", "document")

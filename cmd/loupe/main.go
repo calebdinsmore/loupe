@@ -15,6 +15,7 @@ import (
 
 	"github.com/calebjdinsmore/loupe/internal/agent"
 	"github.com/calebjdinsmore/loupe/internal/git"
+	"github.com/calebjdinsmore/loupe/internal/prompts"
 	"github.com/calebjdinsmore/loupe/internal/server"
 	"github.com/calebjdinsmore/loupe/internal/store"
 )
@@ -30,13 +31,17 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if err := prompts.New(root).Seed(); err != nil {
+		log.Fatal(err)
+	}
+
 	st, err := store.Open(filepath.Join(dataDir, "loupe.db"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer st.Close()
 
-	srv := server.New(git.New(root), st, agent.New(root))
+	srv := server.New(git.New(root), st, agent.New(root), prompts.New(root))
 
 	// LOUPE_ADDR pins the port for `vite dev` proxying; otherwise pick any free one.
 	addr := os.Getenv("LOUPE_ADDR")

@@ -11,9 +11,11 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/calebjdinsmore/loupe/internal/agent"
 	"github.com/calebjdinsmore/loupe/internal/git"
+	"github.com/calebjdinsmore/loupe/internal/prompts"
 	"github.com/calebjdinsmore/loupe/internal/store"
 )
 
@@ -25,7 +27,12 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 	}
 	t.Cleanup(func() { st.Close() })
 	// git/agent point at a temp dir; the routes under test never invoke them.
-	srv := New(git.New(t.TempDir()), st, agent.New(t.TempDir()))
+	// The prompts loader is seeded so /api/prompts has the three defaults.
+	pl := prompts.New(t.TempDir())
+	if err := pl.Seed(); err != nil {
+		t.Fatalf("prompts.Seed: %v", err)
+	}
+	srv := New(git.New(t.TempDir()), st, agent.New(t.TempDir()), pl)
 	return srv, st
 }
 
@@ -157,6 +164,119 @@ func TestListReviewsEmbedsComments(t *testing.T) {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
+// promptsResp mirrors the /api/prompts payload.
+type promptsResp struct {
+	Prompts []struct {
+		ID   string `json:"ID"`
+		Name string `json:"Name"`
+	} `json:"prompts"`
+	Selected string `json:"selected"`
+}
+
+func getPrompts(t *testing.T, srv *Server) promptsResp {
+	t.Helper()
+	w := do(t, srv, http.MethodGet, "/api/prompts", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /api/prompts = %d (%s)", w.Code, w.Body.String())
+	}
+	var out promptsResp
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode prompts: %v", err)
+	}
+	return out
+}
+
+// TestPromptsEndpointDefaults verifies a freshly seeded loader exposes the three
+// default prompts (sorted by id) and defaults the selection to "document".
+func TestPromptsEndpointDefaults(t *testing.T) {
+	srv, _ := newTestServer(t)
+	out := getPrompts(t, srv)
+	var ids []string
+	for _, p := range out.Prompts {
+		ids = append(ids, p.ID)
+	}
+	if len(ids) != 3 || ids[0] != "beads" || ids[1] != "direct" || ids[2] != "document" {
+		t.Fatalf("expected [beads direct document], got %v", ids)
+	}
+	if out.Selected != "document" {
+		t.Fatalf("default selected = %q, want document", out.Selected)
+	}
+}
+
+// TestPromptsSelectionPersistsOnSubmit checks that submitting persists the chosen
+// prompt as the global selection (this happens before the no-pending-comments
+// guard, so it sticks even when there is nothing to run).
+func TestPromptsSelectionPersistsOnSubmit(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	// No pending comments: submit 400s after persisting the selection.
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/submit", `{"mode":"direct"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("submit = %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+	if out := getPrompts(t, srv); out.Selected != "direct" {
+		t.Fatalf("selected after submit = %q, want direct", out.Selected)
+	}
+}
+
+// TestPromptsSelectionFallsBack verifies the selection falls back to an existing
+// prompt when last_prompt points at one that no longer exists.
+func TestPromptsSelectionFallsBack(t *testing.T) {
+	srv, st := newTestServer(t)
+	if err := st.SetSetting("last_prompt", "ghost"); err != nil {
+		t.Fatalf("SetSetting: %v", err)
+	}
+	if out := getPrompts(t, srv); out.Selected != "document" {
+		t.Fatalf("selected with stale last_prompt = %q, want document fallback", out.Selected)
+	}
+}
+
+// TestSubmitMissingPromptBroadcastsError verifies that submitting a review whose
+// prompt id no longer resolves broadcasts an error event and marks the review
+// errored, rather than running the agent with an empty task.
+func TestSubmitMissingPromptBroadcastsError(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	if _, err := st.AddComment(store.Comment{ReviewID: rev, Path: "a.go", Line: 1, Body: "x"}); err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+	// Subscribe before submitting so the run's error event is delivered live.
+	ch := srv.hubFor(rev).subscribe()
+
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/submit", `{"mode":"ghost"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("submit = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+
+	select {
+	case ev := <-ch:
+		if ev.Type != agent.EventError {
+			t.Fatalf("first event = %q, want error", ev.Type)
+		}
+		if !strings.Contains(ev.Text, "ghost") {
+			t.Fatalf("error text %q should name the missing prompt", ev.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the render error event")
+	}
+
+	// The run never started: status is error.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got, err := st.Review(rev)
+		if err != nil {
+			t.Fatalf("Review: %v", err)
+		}
+		if got.Status == "error" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %q, want error", got.Status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestDiffWorkingRefRoutesToWorkingTree verifies the working-tree sentinel
 // routes /api/diff to DiffWorking: requesting branch=*working* surfaces an
 // uncommitted edit that the committed branch diff does not.
@@ -195,7 +315,7 @@ func TestDiffWorkingRefRoutesToWorkingTree(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := New(git.New(dir), st, agent.New(dir))
+	srv := New(git.New(dir), st, agent.New(dir), prompts.New(t.TempDir()))
 
 	diffOf := func(branch string) string {
 		t.Helper()
@@ -263,7 +383,7 @@ func TestDiffCurrentBranchFoldsWorkingTree(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := New(git.New(dir), st, agent.New(dir))
+	srv := New(git.New(dir), st, agent.New(dir), prompts.New(t.TempDir()))
 
 	diffOf := func(branch string) string {
 		t.Helper()
@@ -338,7 +458,7 @@ func TestDiffDetachedHeadRoutesToCommittedDiff(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	srv := New(git.New(dir), st, agent.New(dir))
+	srv := New(git.New(dir), st, agent.New(dir), prompts.New(t.TempDir()))
 
 	if cur := git.New(dir).CurrentBranch(); cur != "" {
 		t.Fatalf("expected detached HEAD (empty CurrentBranch), got %q", cur)

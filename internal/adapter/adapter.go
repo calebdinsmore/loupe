@@ -1,5 +1,5 @@
 // Package adapter turns a submitted review into the prompt and tool allowlist
-// for the chosen output mode: beads, document, or direct edits.
+// handed to the agent.
 package adapter
 
 import (
@@ -10,48 +10,15 @@ import (
 	"github.com/calebjdinsmore/loupe/internal/store"
 )
 
-type Mode string
-
-const (
-	ModeBeads    Mode = "beads"
-	ModeDocument Mode = "document"
-	ModeDirect   Mode = "direct"
-)
-
-// AllowedTools is the minimal tool set each mode needs, so headless runs don't
-// stall on permission prompts.
-func AllowedTools(m Mode) []string {
-	switch m {
-	case ModeBeads:
-		return []string{"Bash(bd:*)", "Read", "Grep", "Glob"}
-	case ModeDocument:
-		return []string{"Write", "Read", "Grep", "Glob"}
-	case ModeDirect:
-		return []string{"Edit", "Write", "Read", "Grep", "Glob", "Bash"}
-	default:
-		return []string{"Read", "Grep", "Glob"}
-	}
+// DefaultTools is the permissive allowlist used for every prompt so headless
+// runs do not stall on permission prompts.
+func DefaultTools() []string {
+	return []string{"Edit", "Write", "Read", "Grep", "Glob", "Bash"}
 }
 
-func instruction(m Mode, reviewID int64) string {
-	switch m {
-	case ModeBeads:
-		return "Using the `bd` CLI, create one epic issue for this review and a child issue " +
-			"for each cluster of related comments, wiring up parent/child dependencies. " +
-			"Do not modify code — only create issues."
-	case ModeDocument:
-		return fmt.Sprintf("Write a markdown implementation plan that addresses every comment to "+
-			"`.loupe/plans/review-%d.md`. Research the codebase as needed. Do not modify any other files.", reviewID)
-	case ModeDirect:
-		return "Address each comment by editing the working tree directly. " +
-			"After each change, briefly state which comment it resolves."
-	default:
-		return ""
-	}
-}
-
-// BuildPrompt assembles the full payload handed to the agent.
-func BuildPrompt(r store.Review, comments []store.Comment, diff string) string {
+// BuildPrompt assembles the full payload handed to the agent. The task text is
+// the rendered prompt body that goes under the "## Your task" header.
+func BuildPrompt(r store.Review, comments []store.Comment, diff, task string) string {
 	var b strings.Builder
 	if r.Branch == git.WorkingRef {
 		fmt.Fprintf(&b, "You are addressing a code review of the uncommitted working-tree changes against base `%s` (committed + uncommitted changes together).\n\n", r.Base)
@@ -71,6 +38,6 @@ func BuildPrompt(r store.Review, comments []store.Comment, diff string) string {
 	b.WriteString("\n## Diff under review\n\n```diff\n")
 	b.WriteString(diff)
 	b.WriteString("```\n\n## Your task\n\n")
-	b.WriteString(instruction(Mode(r.Mode), r.ID))
+	b.WriteString(task)
 	return b.String()
 }
