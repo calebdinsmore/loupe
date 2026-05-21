@@ -8,6 +8,9 @@ export interface CommentInput {
   path: string
   side: string
   line: number
+  // anchor_text is the content of the commented line, captured at creation so a
+  // drifted comment can be relocated rather than misplaced. See anchor.ts.
+  anchor_text: string
   body: string
 }
 
@@ -19,6 +22,7 @@ export interface StoredComment {
   side: string
   line: number
   blob_sha: string
+  anchor_text: string
   body: string
   submitted: boolean
   collapsed: boolean

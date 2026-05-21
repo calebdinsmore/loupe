@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -153,3 +156,220 @@ func TestListReviewsEmbedsComments(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// TestDiffWorkingRefRoutesToWorkingTree verifies the working-tree sentinel
+// routes /api/diff to DiffWorking: requesting branch=*working* surfaces an
+// uncommitted edit that the committed branch diff does not.
+func TestDiffWorkingRefRoutesToWorkingTree(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	write("file.txt", "base line\n")
+	runGit("add", "file.txt")
+	runGit("commit", "-m", "base")
+	// A second, non-checked-out branch sitting at the base commit. Its diff
+	// against main is empty and, crucially, it never reflects the working tree —
+	// so it stays committed-only even after the uncommitted edit below.
+	runGit("branch", "other")
+	// Stay on main and make an uncommitted edit in the working tree.
+	write("file.txt", "base line\nuncommitted line\n")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(git.New(dir), st, agent.New(dir))
+
+	diffOf := func(branch string) string {
+		t.Helper()
+		target := "/api/diff?base=main&branch=" + url.QueryEscape(branch)
+		w := do(t, srv, http.MethodGet, target, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("diff %s = %d (%s)", branch, w.Code, w.Body.String())
+		}
+		var out struct {
+			Diff string `json:"diff"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode diff: %v", err)
+		}
+		return out.Diff
+	}
+
+	// A non-checked-out branch keeps the committed-only diff (no working tree).
+	if got := diffOf("other"); strings.Contains(got, "uncommitted line") {
+		t.Fatalf("committed diff unexpectedly contains the uncommitted edit:\n%s", got)
+	}
+	// The sentinel routes to DiffWorking, which surfaces the uncommitted edit.
+	if got := diffOf(git.WorkingRef); !strings.Contains(got, "uncommitted line") {
+		t.Fatalf("working-tree diff missing the uncommitted edit:\n%s", got)
+	}
+}
+
+// TestDiffCurrentBranchFoldsWorkingTree verifies the refinement from loupe-2sq.4:
+// requesting the currently checked-out branch folds in uncommitted working
+// changes (routes to DiffWorking) without selecting the *working* sentinel, while
+// a different, non-checked-out branch stays committed-only.
+func TestDiffCurrentBranchFoldsWorkingTree(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	write("file.txt", "base line\n")
+	runGit("add", "file.txt")
+	runGit("commit", "-m", "base")
+	// Branch off and commit a change, then check the feature branch out so it is
+	// the current branch. main stays at the base commit (non-checked-out).
+	runGit("checkout", "-b", "feature")
+	write("file.txt", "base line\ncommitted feature line\n")
+	runGit("commit", "-am", "feature change")
+	// Uncommitted edit in the working tree on the current (feature) branch.
+	write("file.txt", "base line\ncommitted feature line\nuncommitted line\n")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(git.New(dir), st, agent.New(dir))
+
+	diffOf := func(branch string) string {
+		t.Helper()
+		target := "/api/diff?base=main&branch=" + url.QueryEscape(branch)
+		w := do(t, srv, http.MethodGet, target, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("diff %s = %d (%s)", branch, w.Code, w.Body.String())
+		}
+		var out struct {
+			Diff string `json:"diff"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode diff: %v", err)
+		}
+		return out.Diff
+	}
+
+	// The current branch folds in the working tree: both the committed feature
+	// change and the uncommitted edit show, with no *working* selection.
+	cur := diffOf("feature")
+	if !strings.Contains(cur, "committed feature line") {
+		t.Fatalf("current-branch diff missing the committed change:\n%s", cur)
+	}
+	if !strings.Contains(cur, "uncommitted line") {
+		t.Fatalf("current-branch diff missing the uncommitted edit:\n%s", cur)
+	}
+	// A different, non-checked-out branch stays committed-only — main sits at the
+	// base commit and never reflects feature's working tree.
+	if got := diffOf("main"); strings.Contains(got, "uncommitted line") {
+		t.Fatalf("non-checked-out branch diff unexpectedly contains the uncommitted edit:\n%s", got)
+	}
+}
+
+// TestDiffDetachedHeadRoutesToCommittedDiff covers the cur != "" guard in
+// diffFor: when HEAD is detached, CurrentBranch() is "", so no requested branch
+// should be mistaken for "the current branch". A request for a real branch must
+// route to the committed-only Diff path even though uncommitted edits sit in the
+// working tree — otherwise a detached checkout would silently fold them in.
+func TestDiffDetachedHeadRoutesToCommittedDiff(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	runGit("init", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	write("file.txt", "base line\n")
+	runGit("add", "file.txt")
+	runGit("commit", "-m", "base")
+	runGit("checkout", "-b", "feature")
+	write("file.txt", "base line\ncommitted feature line\n")
+	runGit("commit", "-am", "feature change")
+	// Detach HEAD at feature's tip, then make an uncommitted edit. CurrentBranch()
+	// now returns "" — the working tree no longer belongs to a named branch.
+	runGit("checkout", "--detach")
+	write("file.txt", "base line\ncommitted feature line\nuncommitted line\n")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(git.New(dir), st, agent.New(dir))
+
+	if cur := git.New(dir).CurrentBranch(); cur != "" {
+		t.Fatalf("expected detached HEAD (empty CurrentBranch), got %q", cur)
+	}
+
+	// A request for a real branch routes to the committed-only Diff path: the
+	// committed feature change shows, the working-tree edit does not.
+	target := "/api/diff?base=main&branch=" + url.QueryEscape("feature")
+	w := do(t, srv, http.MethodGet, target, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("diff feature = %d (%s)", w.Code, w.Body.String())
+	}
+	var out struct {
+		Diff string `json:"diff"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode diff: %v", err)
+	}
+	if !strings.Contains(out.Diff, "committed feature line") {
+		t.Fatalf("committed diff missing the committed change:\n%s", out.Diff)
+	}
+	if strings.Contains(out.Diff, "uncommitted line") {
+		t.Fatalf("detached-HEAD request unexpectedly folded in the working tree:\n%s", out.Diff)
+	}
+
+	// Pin the `cur != ""` guard specifically: an empty branch param must not match
+	// the (also empty) detached CurrentBranch and route to DiffWorking. Without the
+	// guard, "" == "" would fold the working tree in; with it, the empty ref falls
+	// through to Diff and errors. Either way the uncommitted edit must never leak.
+	empty := do(t, srv, http.MethodGet, "/api/diff?base=main&branch=", "")
+	if strings.Contains(empty.Body.String(), "uncommitted line") {
+		t.Fatalf("empty branch param under detached HEAD folded in the working tree (guard regressed):\n%s", empty.Body.String())
+	}
+}

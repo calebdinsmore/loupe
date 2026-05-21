@@ -78,8 +78,26 @@ func (s *Server) handleBranches(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// diffFor returns the diff for a base/branch pair, dispatching to DiffWorking so
+// committed + uncommitted changes show together when either the explicit
+// working-tree sentinel is selected or the requested branch is the currently
+// checked-out branch — for the current branch we can show the live working tree,
+// so the default view folds in uncommitted work without a separate selection.
+// Any other (non-checked-out) branch keeps the commit-to-commit diff, since its
+// working tree isn't on disk. Shared by handleDiff and runReview so the live view
+// and the agent prompt see the same diff.
+func (s *Server) diffFor(base, branch string) (string, error) {
+	if branch == git.WorkingRef {
+		return s.git.DiffWorking(base)
+	}
+	if cur := s.git.CurrentBranch(); cur != "" && branch == cur {
+		return s.git.DiffWorking(base)
+	}
+	return s.git.Diff(base, branch)
+}
+
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
-	diff, err := s.git.Diff(r.URL.Query().Get("base"), r.URL.Query().Get("branch"))
+	diff, err := s.diffFor(r.URL.Query().Get("base"), r.URL.Query().Get("branch"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -275,7 +293,7 @@ func (s *Server) runReview(id int64, batch []store.Comment) {
 		h.broadcast(agent.Event{Type: agent.EventError, Text: err.Error()})
 		return
 	}
-	diff, _ := s.git.Diff(rev.Base, rev.Branch)
+	diff, _ := s.diffFor(rev.Base, rev.Branch)
 
 	prompt := adapter.BuildPrompt(rev, batch, diff)
 	tools := adapter.AllowedTools(adapter.Mode(rev.Mode))

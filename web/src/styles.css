@@ -41,7 +41,28 @@ select, textarea, button {
   font: inherit;
 }
 
-.layout { flex: 1; display: grid; grid-template-columns: 1fr 360px; overflow: hidden; }
+.layout { flex: 1; display: grid; grid-template-columns: 260px 1fr 360px; overflow: hidden; }
+.layout.tree-collapsed { grid-template-columns: 28px 1fr 360px; }
+
+/* Left file-tree navigation panel. */
+.filetree-panel { border-right: 1px solid var(--border); background: var(--panel); overflow: auto; display: flex; flex-direction: column; }
+.ft-head { display: flex; align-items: center; justify-content: space-between; padding: 0.5rem 0.5rem 0.5rem 0.75rem; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); }
+.filetree-rail { border-right: 1px solid var(--border); background: var(--panel); display: flex; justify-content: center; padding-top: 0.5rem; }
+.ft-toggle { background: transparent; border: 1px solid var(--border); color: var(--muted); cursor: pointer; padding: 0.1rem 0.4rem; line-height: 1; }
+.ft-toggle:hover { color: var(--fg); border-color: var(--accent); }
+
+.filetree { padding: 0.25rem 0; }
+.ft-empty { padding: 0.75rem; font-size: 0.8rem; }
+.ft-row { display: flex; align-items: center; gap: 0.4rem; width: 100%; text-align: left; background: transparent; border: none; border-radius: 0; color: var(--fg); cursor: pointer; padding: 0.2rem 0.5rem; font-size: 12.5px; }
+.ft-row:hover { background: rgba(47, 129, 247, 0.08); }
+.ft-dir { color: var(--muted); }
+.ft-caret { display: inline-block; width: 1ch; color: var(--muted); flex-shrink: 0; }
+.ft-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.ft-file.active { background: rgba(47, 129, 247, 0.18); color: var(--fg); box-shadow: inset 2px 0 0 var(--accent); }
+.ft-badges { display: flex; gap: 0.35rem; align-items: center; flex-shrink: 0; font-size: 0.65rem; font-family: ui-monospace, monospace; }
+.ft-comments { color: var(--accent); }
+.ft-add { color: #3fb950; }
+.ft-del { color: #f85149; }
 
 .diff { overflow: auto; padding: 1rem; }
 .empty { color: var(--muted); }
@@ -70,6 +91,12 @@ select, textarea, button {
   100% { box-shadow: inset 3px 0 0 transparent; }
 }
 
+.file.flash { animation: file-flash 1.2s ease-out; }
+@keyframes file-flash {
+  0% { box-shadow: 0 0 0 2px var(--accent); }
+  100% { box-shadow: 0 0 0 2px transparent; }
+}
+
 .comment-full { display: flex; justify-content: space-between; gap: 0.75rem; align-items: flex-start; }
 .comment-body { flex: 1; }
 .comment-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
@@ -77,6 +104,14 @@ select, textarea, button {
 .comment-actions button:hover { color: var(--fg); border-color: var(--accent); }
 
 .badge { margin-left: 0.5rem; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.4px; color: #3fb950; border: 1px solid #234d32; border-radius: 999px; padding: 0.05rem 0.4rem; }
+
+/* Per-file home for comments whose anchored line no longer exists in the diff. */
+.outdated { margin: 0.25rem 0.75rem 0.75rem; border: 1px dashed var(--border); border-radius: 6px; background: #15110b; }
+.outdated > summary { cursor: pointer; padding: 0.4rem 0.6rem; font-size: 0.75rem; color: #d29922; list-style-position: inside; }
+.outdated-list { list-style: none; margin: 0; padding: 0.25rem 0.6rem 0.5rem; }
+.outdated-list li { display: flex; justify-content: space-between; gap: 0.75rem; align-items: flex-start; padding: 0.4rem 0; border-top: 1px dashed var(--border); }
+.outdated-list li:first-child { border-top: none; }
+.outdated .badge { color: #d29922; border-color: #5a4711; }
 
 .comment-row.submitted td { background: #0e1a12; border-left: 2px solid #234d32; }
 .comment-collapsed { width: 100%; text-align: left; background: transparent; border: none; color: var(--muted); cursor: pointer; padding: 0; }

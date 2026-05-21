@@ -1,4 +1,5 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
+import { FileTree, type FileMeta } from './FileTreePanel'
 import {
   addComment,
   deleteComment as apiDeleteComment,
@@ -9,6 +10,7 @@ import {
   submitReview,
   updateComment,
 } from './api'
+import { relocate } from './anchor'
 import { parseUnifiedDiff, type DiffLine, type FileDiff } from './diff'
 import { appendEvent, type AgentEvent } from './events'
 import { highlightLine, langForPath } from './highlight'
@@ -16,11 +18,20 @@ import 'highlight.js/styles/github-dark.css'
 
 type Mode = 'beads' | 'document' | 'direct'
 
+// WORKING_REF mirrors git.WorkingRef: a sentinel "branch" that selects the
+// working tree (committed + uncommitted changes) instead of a real branch. It
+// flows through the existing base/branch UI, persistence key, and WebSocket
+// untouched, so no API shape changes are needed.
+const WORKING_REF = '*working*'
+
 interface Comment {
   id: number
   path: string
   line: number
   side: string
+  // anchorText is the commented line's content at creation, used to relocate the
+  // comment when the diff drifts. Empty for legacy comments (treated as no anchor).
+  anchorText: string
   body: string
   submitted: boolean
   collapsed: boolean
@@ -31,10 +42,13 @@ interface Editor {
   path: string
   line: number
   side: string
+  anchorText: string
   id?: number
 }
 
 const rowId = (path: string, line: number) => `loc-${path.replace(/[^a-zA-Z0-9]/g, '_')}-${line}`
+// Stable scroll-target id for a file's <section>, used by the tree sidebar.
+const fileId = (path: string) => `file-${path.replace(/[^a-zA-Z0-9]/g, '_')}`
 
 export default function App() {
   const [branches, setBranches] = useState<string[]>([])
@@ -49,6 +63,14 @@ export default function App() {
   const [events, setEvents] = useState<AgentEvent[]>([])
   const [running, setRunning] = useState(false)
   const [flash, setFlash] = useState<string | null>(null)
+  // Bumped by the Refresh button to re-pull the diff. Working-tree diffs are
+  // live, so unlike committed branch diffs they can change without base/branch
+  // changing.
+  const [refreshKey, setRefreshKey] = useState(0)
+  // Left file-tree nav: whether the panel is collapsed to a rail, and which file
+  // is currently in view (scroll-spy highlight).
+  const [treeCollapsed, setTreeCollapsed] = useState(false)
+  const [activeFile, setActiveFile] = useState<string | null>(null)
 
   useEffect(() => {
     getBranches().then((info) => {
@@ -58,12 +80,22 @@ export default function App() {
     })
   }, [])
 
+  // Pull the diff. Separate from review hydration so the Refresh button can
+  // re-pull a live working-tree diff without resetting comment state.
   useEffect(() => {
     if (!(base && branch && base !== branch)) return
     let cancelled = false
     getDiff(base, branch).then((raw) => {
       if (!cancelled) setFiles(parseUnifiedDiff(raw))
     })
+    return () => {
+      cancelled = true
+    }
+  }, [base, branch, refreshKey])
+
+  useEffect(() => {
+    if (!(base && branch && base !== branch)) return
+    let cancelled = false
     // Reattach to the persisted review for this pair so submitted comments
     // reappear (collapsed/resolved) after a reload.
     setReviewId(null)
@@ -80,6 +112,7 @@ export default function App() {
         path: c.path,
         line: c.line,
         side: c.side,
+        anchorText: c.anchor_text,
         body: c.body,
         submitted: c.submitted,
         collapsed: c.collapsed,
@@ -93,14 +126,94 @@ export default function App() {
 
   const pending = comments.filter((c) => !c.submitted)
 
+  const paths = useMemo(() => files.map((f) => f.path), [files])
+
+  // Per-file badge data for the tree: +/- line counts from the diff plus the
+  // count of pending comments anchored in each file.
+  const fileMeta = useMemo(() => {
+    const m: Record<string, FileMeta> = {}
+    for (const f of files) {
+      let add = 0
+      let del = 0
+      for (const h of f.hunks) {
+        for (const l of h.lines) {
+          if (l.kind === 'add') add++
+          else if (l.kind === 'del') del++
+        }
+      }
+      m[f.path] = { add, del, comments: 0 }
+    }
+    for (const c of comments) {
+      if (!c.submitted && m[c.path]) m[c.path].comments++
+    }
+    return m
+  }, [files, comments])
+
+  // Resolve every comment against the freshly parsed diff. A comment whose stored
+  // line still matches (or relocates within the search window) renders inline at
+  // its current line; one that can't be placed is collected as orphaned so it can
+  // surface in the per-file "outdated comments" section instead of vanishing.
+  const located = useMemo(() => {
+    const byPath = new Map<string, { inline: Map<number, Comment[]>; orphaned: Comment[] }>()
+    for (const f of files) {
+      const entry = { inline: new Map<number, Comment[]>(), orphaned: [] as Comment[] }
+      for (const c of comments) {
+        if (c.path !== f.path) continue
+        const ln = relocate({ line: c.line, anchorText: c.anchorText }, f)
+        if (ln == null) {
+          entry.orphaned.push(c)
+        } else {
+          const arr = entry.inline.get(ln) ?? []
+          arr.push(c)
+          entry.inline.set(ln, arr)
+        }
+      }
+      byPath.set(f.path, entry)
+    }
+    return byPath
+  }, [files, comments])
+
+  // Scroll-spy: highlight the file whose section is most prominently in view.
+  useEffect(() => {
+    const root = document.querySelector('.diff')
+    if (!root || files.length === 0) return
+    const sections = Array.from(root.querySelectorAll<HTMLElement>('section.file[data-path]'))
+    if (sections.length === 0) return
+    const ratios = new Map<string, number>()
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const p = (e.target as HTMLElement).dataset.path
+          if (p) ratios.set(p, e.isIntersecting ? e.intersectionRatio : 0)
+        }
+        let best: string | null = null
+        let bestRatio = 0
+        for (const [p, r] of ratios) {
+          if (r > bestRatio) {
+            bestRatio = r
+            best = p
+          }
+        }
+        // Always assign (including null) so the highlight clears when every
+        // section has scrolled out of view rather than going stale.
+        setActiveFile(best)
+      },
+      { root, threshold: [0, 0.25, 0.5, 1] },
+    )
+    sections.forEach((s) => obs.observe(s))
+    return () => obs.disconnect()
+  }, [files])
+
   function openNew(path: string, line: DiffLine) {
     const ln = line.newLine ?? line.oldLine ?? 0
-    setEditor({ path, line: ln, side: line.kind === 'del' ? 'left' : 'right' })
+    // Capture the line's content as the anchor so the comment can relocate if the
+    // diff later shifts.
+    setEditor({ path, line: ln, side: line.kind === 'del' ? 'left' : 'right', anchorText: line.content })
     setDraft('')
   }
 
   function startEdit(c: Comment) {
-    setEditor({ path: c.path, line: c.line, side: c.side, id: c.id })
+    setEditor({ path: c.path, line: c.line, side: c.side, anchorText: c.anchorText, id: c.id })
     setDraft(c.body)
     jumpTo(c.path, c.line)
   }
@@ -129,10 +242,16 @@ export default function App() {
       )
     } else {
       const id = await ensureReviewId()
-      const created = await addComment(id, { path: target.path, side: target.side, line: target.line, body })
+      const created = await addComment(id, {
+        path: target.path,
+        side: target.side,
+        line: target.line,
+        anchor_text: target.anchorText,
+        body,
+      })
       setComments((cs) => [
         ...cs,
-        { id: created.id, path: created.path, line: created.line, side: created.side, body: created.body, submitted: created.submitted, collapsed: created.collapsed },
+        { id: created.id, path: created.path, line: created.line, side: created.side, anchorText: created.anchor_text, body: created.body, submitted: created.submitted, collapsed: created.collapsed },
       ])
     }
   }
@@ -154,6 +273,14 @@ export default function App() {
   function jumpTo(path: string, line: number) {
     const id = rowId(path, line)
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    setFlash(id)
+    setTimeout(() => setFlash((f) => (f === id ? null : f)), 1200)
+  }
+
+  // Scroll the diff to a file's section header, reusing jumpTo's flash pattern.
+  function scrollToFile(path: string) {
+    const id = fileId(path)
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     setFlash(id)
     setTimeout(() => setFlash((f) => (f === id ? null : f)), 1200)
   }
@@ -187,16 +314,24 @@ export default function App() {
     ws.onclose = () => setRunning(false)
   }
 
+  // editorForm is the textarea + actions, reused both inline in the diff table
+  // (wrapped in a row) and standalone in the outdated-comments section.
+  function editorForm() {
+    return (
+      <>
+        <textarea autoFocus value={draft} placeholder="Leave a comment…" onChange={(e) => setDraft(e.target.value)} />
+        <div className="edit-actions">
+          <button onClick={saveEditor}>{editor?.id ? 'Save' : 'Add'}</button>
+          <button className="ghost" onClick={() => setEditor(null)}>Cancel</button>
+        </div>
+      </>
+    )
+  }
+
   function editorRow() {
     return (
       <tr className="comment-edit">
-        <td colSpan={3}>
-          <textarea autoFocus value={draft} placeholder="Leave a comment…" onChange={(e) => setDraft(e.target.value)} />
-          <div className="edit-actions">
-            <button onClick={saveEditor}>{editor?.id ? 'Save' : 'Add'}</button>
-            <button className="ghost" onClick={() => setEditor(null)}>Cancel</button>
-          </div>
-        </td>
+        <td colSpan={3}>{editorForm()}</td>
       </tr>
     )
   }
@@ -217,19 +352,47 @@ export default function App() {
             branch
             <select value={branch} onChange={(e) => setBranch(e.target.value)}>
               <option value="">select…</option>
+              <option value={WORKING_REF}>Working tree (uncommitted)</option>
               {branches.map((b) => <option key={b}>{b}</option>)}
             </select>
           </label>
+          <button
+            className="refresh"
+            onClick={() => setRefreshKey((k) => k + 1)}
+            disabled={!(base && branch && base !== branch)}
+            title="Re-pull the diff (working-tree diffs are live)"
+          >
+            Refresh diff
+          </button>
         </div>
       </header>
 
-      <div className="layout">
+      <div className={`layout ${treeCollapsed ? 'tree-collapsed' : ''}`}>
+        {treeCollapsed ? (
+          <div className="filetree-rail">
+            <button className="ft-toggle" onClick={() => setTreeCollapsed(false)} title="Show file tree">
+              ›
+            </button>
+          </div>
+        ) : (
+          <aside className="filetree-panel">
+            <div className="ft-head">
+              <span>Files</span>
+              <button className="ft-toggle" onClick={() => setTreeCollapsed(true)} title="Collapse file tree">
+                ‹
+              </button>
+            </div>
+            <FileTree paths={paths} activePath={activeFile} meta={fileMeta} onSelect={scrollToFile} />
+          </aside>
+        )}
         <main className="diff">
           {files.length === 0 && <p className="empty">Pick a branch to review.</p>}
           {files.map((f) => {
             const lang = langForPath(f.path)
+            const loc = located.get(f.path)
+            const orphaned = loc?.orphaned ?? []
             return (
-              <section key={f.path} className="file">
+              <section key={f.path} id={fileId(f.path)} data-path={f.path} className={`file ${flash === fileId(f.path) ? 'flash' : ''}`}>
                 <div className="file-head">{f.path}</div>
                 <table>
                   <tbody>
@@ -241,7 +404,7 @@ export default function App() {
                         {h.lines.map((l, li) => {
                           const ln = l.newLine ?? l.oldLine ?? 0
                           const id = rowId(f.path, ln)
-                          const rowComments = comments.filter((c) => c.path === f.path && c.line === ln)
+                          const rowComments = loc?.inline.get(ln) ?? []
                           const editingHere = editor?.path === f.path && editor.line === ln
                           return (
                             <Fragment key={li}>
@@ -289,6 +452,33 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
+                {orphaned.length > 0 && (
+                  <details className="outdated">
+                    <summary>
+                      {orphaned.length} outdated comment{orphaned.length === 1 ? '' : 's'} · no longer match a line
+                    </summary>
+                    <ul className="outdated-list">
+                      {orphaned.map((c) => (
+                        <li key={c.id}>
+                          {editor?.id === c.id ? (
+                            editorForm()
+                          ) : (
+                            <>
+                              <div className="comment-body">
+                                💬 {c.body}
+                                <span className="badge">was line {c.line}</span>
+                              </div>
+                              <div className="comment-actions">
+                                <button onClick={() => startEdit(c)}>Edit</button>
+                                <button onClick={() => deleteComment(c.id)}>Delete</button>
+                              </div>
+                            </>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
               </section>
             )
           })}

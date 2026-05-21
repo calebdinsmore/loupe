@@ -23,15 +23,19 @@ type Review struct {
 }
 
 type Comment struct {
-	ID        int64  `json:"id"`
-	ReviewID  int64  `json:"review_id"`
-	Path      string `json:"path"`
-	Side      string `json:"side"` // "left" (deletion) | "right" (addition/context)
-	Line      int    `json:"line"` // 0 means a file-level comment
-	BlobSHA   string `json:"blob_sha"`
-	Body      string `json:"body"`
-	Submitted bool   `json:"submitted"` // sent to the agent as part of a review run
-	Collapsed bool   `json:"collapsed"` // shown resolved/folded in the UI
+	ID       int64  `json:"id"`
+	ReviewID int64  `json:"review_id"`
+	Path     string `json:"path"`
+	Side     string `json:"side"` // "left" (deletion) | "right" (addition/context)
+	Line     int    `json:"line"` // 0 means a file-level comment
+	BlobSHA  string `json:"blob_sha"`
+	// AnchorText is the content of the commented line, captured at creation. It
+	// lets the frontend relocate a comment whose stored line has drifted (working
+	// -tree edits, amend/rebase) instead of misplacing or losing it.
+	AnchorText string `json:"anchor_text"`
+	Body       string `json:"body"`
+	Submitted  bool   `json:"submitted"` // sent to the agent as part of a review run
+	Collapsed  bool   `json:"collapsed"` // shown resolved/folded in the UI
 }
 
 const schema = `
@@ -51,6 +55,7 @@ CREATE TABLE IF NOT EXISTS comments (
   side       TEXT NOT NULL DEFAULT 'right',
   line       INTEGER NOT NULL DEFAULT 0,
   blob_sha   TEXT NOT NULL DEFAULT '',
+  anchor_text TEXT NOT NULL DEFAULT '',
   body       TEXT NOT NULL,
   submitted  INTEGER NOT NULL DEFAULT 0,
   collapsed  INTEGER NOT NULL DEFAULT 0,
@@ -63,6 +68,7 @@ CREATE TABLE IF NOT EXISTS comments (
 var migrations = []string{
 	`ALTER TABLE comments ADD COLUMN submitted INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE comments ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE comments ADD COLUMN anchor_text TEXT NOT NULL DEFAULT ''`,
 }
 
 func Open(path string) (*Store, error) {
@@ -139,8 +145,8 @@ func (s *Store) Reviews(branch, base string) ([]Review, error) {
 
 func (s *Store) AddComment(c Comment) (int64, error) {
 	res, err := s.db.Exec(
-		`INSERT INTO comments (review_id, path, side, line, blob_sha, body, submitted, collapsed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ReviewID, c.Path, c.Side, c.Line, c.BlobSHA, c.Body, c.Submitted, c.Collapsed)
+		`INSERT INTO comments (review_id, path, side, line, blob_sha, anchor_text, body, submitted, collapsed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ReviewID, c.Path, c.Side, c.Line, c.BlobSHA, c.AnchorText, c.Body, c.Submitted, c.Collapsed)
 	if err != nil {
 		return 0, err
 	}
@@ -159,8 +165,8 @@ func (s *Store) UpdateComment(id int64, body string, submitted, collapsed bool) 
 func (s *Store) CommentByID(id int64) (Comment, error) {
 	var c Comment
 	err := s.db.QueryRow(
-		`SELECT id, review_id, path, side, line, blob_sha, body, submitted, collapsed FROM comments WHERE id = ?`, id).
-		Scan(&c.ID, &c.ReviewID, &c.Path, &c.Side, &c.Line, &c.BlobSHA, &c.Body, &c.Submitted, &c.Collapsed)
+		`SELECT id, review_id, path, side, line, blob_sha, anchor_text, body, submitted, collapsed FROM comments WHERE id = ?`, id).
+		Scan(&c.ID, &c.ReviewID, &c.Path, &c.Side, &c.Line, &c.BlobSHA, &c.AnchorText, &c.Body, &c.Submitted, &c.Collapsed)
 	return c, err
 }
 
@@ -177,7 +183,7 @@ func (s *Store) DeleteComment(id int64) error {
 func (s *Store) MarkSubmitted(reviewID int64) ([]Comment, error) {
 	rows, err := s.db.Query(
 		`UPDATE comments SET submitted = 1, collapsed = 1 WHERE review_id = ? AND submitted = 0
-		 RETURNING id, review_id, path, side, line, blob_sha, body, submitted, collapsed`,
+		 RETURNING id, review_id, path, side, line, blob_sha, anchor_text, body, submitted, collapsed`,
 		reviewID)
 	if err != nil {
 		return nil, err
@@ -200,7 +206,7 @@ func (s *Store) MarkSubmitted(reviewID int64) ([]Comment, error) {
 
 func (s *Store) Comments(reviewID int64) ([]Comment, error) {
 	rows, err := s.db.Query(
-		`SELECT id, review_id, path, side, line, blob_sha, body, submitted, collapsed FROM comments WHERE review_id = ? ORDER BY path, line`,
+		`SELECT id, review_id, path, side, line, blob_sha, anchor_text, body, submitted, collapsed FROM comments WHERE review_id = ? ORDER BY path, line`,
 		reviewID)
 	if err != nil {
 		return nil, err
@@ -213,7 +219,7 @@ func scanComments(rows *sql.Rows) ([]Comment, error) {
 	var out []Comment
 	for rows.Next() {
 		var c Comment
-		if err := rows.Scan(&c.ID, &c.ReviewID, &c.Path, &c.Side, &c.Line, &c.BlobSHA, &c.Body, &c.Submitted, &c.Collapsed); err != nil {
+		if err := rows.Scan(&c.ID, &c.ReviewID, &c.Path, &c.Side, &c.Line, &c.BlobSHA, &c.AnchorText, &c.Body, &c.Submitted, &c.Collapsed); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
