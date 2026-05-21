@@ -15,6 +15,7 @@ import (
 
 	"github.com/calebjdinsmore/loupe/internal/agent"
 	"github.com/calebjdinsmore/loupe/internal/git"
+	"github.com/calebjdinsmore/loupe/internal/prompts"
 	"github.com/calebjdinsmore/loupe/internal/server"
 	"github.com/calebjdinsmore/loupe/internal/store"
 )
@@ -27,6 +28,10 @@ func main() {
 
 	dataDir := filepath.Join(root, ".loupe")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := prompts.New(root).Seed(); err != nil {
 		log.Fatal(err)
 	}
 
