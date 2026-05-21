@@ -6,7 +6,9 @@ import {
   ensureReview,
   getBranches,
   getDiff,
+  listPrompts,
   listReviews,
+  type PromptInfo,
   submitReview,
   updateComment,
 } from './api'
@@ -15,8 +17,6 @@ import { parseUnifiedDiff, type DiffLine, type FileDiff } from './diff'
 import { appendEvent, type AgentEvent } from './events'
 import { highlightLine, langForPath } from './highlight'
 import 'highlight.js/styles/github-dark.css'
-
-type Mode = 'beads' | 'document' | 'direct'
 
 // WORKING_REF mirrors git.WorkingRef: a sentinel "branch" that selects the
 // working tree (committed + uncommitted changes) instead of a real branch. It
@@ -59,7 +59,8 @@ export default function App() {
   const [reviewId, setReviewId] = useState<number | null>(null)
   const [editor, setEditor] = useState<Editor | null>(null)
   const [draft, setDraft] = useState('')
-  const [mode, setMode] = useState<Mode>('document')
+  const [mode, setMode] = useState<string>('document')
+  const [prompts, setPrompts] = useState<PromptInfo[]>([])
   const [events, setEvents] = useState<AgentEvent[]>([])
   const [running, setRunning] = useState(false)
   const [flash, setFlash] = useState<string | null>(null)
@@ -77,6 +78,15 @@ export default function App() {
       setBranches(info.branches)
       setBase(info.base)
       if (info.current && info.current !== info.base) setBranch(info.current)
+    })
+  }, [])
+
+  // Hydrate the Output dropdown from the server: the available prompts and the
+  // last-submitted selection (server-driven, no localStorage).
+  useEffect(() => {
+    listPrompts().then(({ prompts, selected }) => {
+      setPrompts(prompts)
+      setMode(selected)
     })
   }, [])
 
@@ -505,10 +515,12 @@ export default function App() {
 
           <label className="mode">
             Output
-            <select value={mode} onChange={(e) => setMode(e.target.value as Mode)}>
-              <option value="document">Document — plan</option>
-              <option value="beads">Beads — epic + issues</option>
-              <option value="direct">Direct — edit code</option>
+            <select value={mode} onChange={(e) => setMode(e.target.value)}>
+              {prompts.map((p) => (
+                <option key={p.ID} value={p.ID}>
+                  {p.Name}
+                </option>
+              ))}
             </select>
           </label>
           <button className="submit" disabled={!pending.length || running} onClick={submit}>

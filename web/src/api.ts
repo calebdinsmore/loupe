@@ -59,6 +59,20 @@ export async function getBranches(): Promise<BranchInfo> {
   return json<BranchInfo>(await fetch('/api/branches'))
 }
 
+// PromptInfo mirrors prompts.Prompt as serialized by the backend (no JSON tags,
+// so the fields are capitalized). ID is the filename stem (the value persisted as
+// the review's mode); Name is its display label.
+export interface PromptInfo {
+  ID: string
+  Name: string
+}
+
+// listPrompts returns the available prompts and the server-provided last
+// selection, so the Output dropdown can render dynamically and preselect it.
+export async function listPrompts(): Promise<{ prompts: PromptInfo[]; selected: string }> {
+  return json<{ prompts: PromptInfo[]; selected: string }>(await fetch('/api/prompts'))
+}
+
 export async function getDiff(base: string, branch: string): Promise<string> {
   const r = await fetch(`/api/diff?base=${encodeURIComponent(base)}&branch=${encodeURIComponent(branch)}`)
   return (await json<{ diff: string }>(r)).diff
