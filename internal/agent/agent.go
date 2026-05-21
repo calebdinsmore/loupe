@@ -29,6 +29,7 @@ type Event struct {
 	Text      string    `json:"text,omitempty"`
 	Tool      string    `json:"tool,omitempty"`
 	SessionID string    `json:"session_id,omitempty"`
+	Ts        int64     `json:"ts,omitempty"` // Unix millis; stamped by the hub on broadcast, not here
 }
 
 // streamLine is the subset of claude's stream-json schema we consume.

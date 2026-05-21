@@ -2,6 +2,7 @@ package server
 
 import (
 	"sync"
+	"time"
 
 	"github.com/calebjdinsmore/loupe/internal/agent"
 )
@@ -41,6 +42,9 @@ func (h *hub) unsubscribe(ch chan agent.Event) {
 func (h *hub) broadcast(ev agent.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if ev.Ts == 0 {
+		ev.Ts = time.Now().UnixMilli()
+	}
 	h.history = append(h.history, ev)
 	for ch := range h.subs {
 		select {

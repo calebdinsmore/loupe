@@ -3,6 +3,7 @@ export interface AgentEvent {
   type: string
   text?: string
   tool?: string
+  ts?: number
 }
 
 // appendEvent adds an incoming agent event to the running log, dropping the

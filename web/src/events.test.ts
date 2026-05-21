@@ -35,4 +35,9 @@ describe('appendEvent', () => {
     expect(appendEvent([], ev('tool_use'))).toEqual([{ type: 'tool_use', text: undefined }])
     expect(appendEvent([], ev('error', 'boom'))).toEqual([{ type: 'error', text: 'boom' }])
   })
+
+  it('passes ts through unchanged', () => {
+    const log = appendEvent([], { type: 'text', text: 'hi', ts: 123 })
+    expect(log).toEqual([{ type: 'text', text: 'hi', ts: 123 }])
+  })
 })
