@@ -1,8 +1,13 @@
-.PHONY: build web run dev tidy clean
+.PHONY: build web run dev test tidy clean
 
 # Build the SPA into the embedded directory, then compile the single binary.
 build: web
 	go build -o loupe ./cmd/loupe
+
+# Run the Go test suite plus the frontend tests (when a runner is configured).
+test:
+	go test ./...
+	cd web && npm test --silent --if-present
 
 web:
 	cd web && npm install && npm run build

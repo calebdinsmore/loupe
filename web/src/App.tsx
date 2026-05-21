@@ -10,16 +10,11 @@ import {
   updateComment,
 } from './api'
 import { parseUnifiedDiff, type DiffLine, type FileDiff } from './diff'
+import { appendEvent, type AgentEvent } from './events'
 import { highlightLine, langForPath } from './highlight'
 import 'highlight.js/styles/github-dark.css'
 
 type Mode = 'beads' | 'document' | 'direct'
-
-interface AgentEvent {
-  type: string
-  text?: string
-  tool?: string
-}
 
 interface Comment {
   id: number
@@ -167,8 +162,18 @@ export default function App() {
     if (running || !pending.length) return
     setRunning(true)
     setEvents([])
-    const id = await ensureReviewId()
-    await submitReview(id, mode)
+    let id: number
+    try {
+      // Resolve the review id and mark the batch submitted before opening the
+      // socket. If either rejects (e.g. a 400 "no pending comments"), surface it
+      // and bail — we must not open a WebSocket for a run that never started.
+      id = await ensureReviewId()
+      await submitReview(id, mode)
+    } catch (err) {
+      setRunning(false)
+      setEvents([{ type: 'error', text: err instanceof Error ? err.message : String(err) }])
+      return
+    }
     // The server marked the pending batch submitted + collapsed; mirror that
     // locally so the UI resolves them and the submit button gates correctly.
     setComments((cs) => cs.map((c) => (c.submitted ? c : { ...c, submitted: true, collapsed: true })))
@@ -177,17 +182,7 @@ export default function App() {
     ws.onmessage = (e) => {
       const ev = JSON.parse(e.data) as AgentEvent
       if (ev.type === 'result' || ev.type === 'error') setRunning(false)
-      setEvents((prev) => {
-        // The terminal 'result' event repeats the agent's final assistant text.
-        // Render it only when it carries something new (e.g. it's the sole
-        // source of the summary) so the closing message never shows twice.
-        if (ev.type === 'result') {
-          const text = (ev.text ?? '').trim()
-          const prevText = (prev[prev.length - 1]?.text ?? '').trim()
-          if (!text || text === prevText) return prev
-        }
-        return [...prev, ev]
-      })
+      setEvents((prev) => appendEvent(prev, ev))
     }
     ws.onclose = () => setRunning(false)
   }

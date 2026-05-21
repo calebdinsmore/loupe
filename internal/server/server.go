@@ -48,6 +48,18 @@ func New(g *git.Service, st *store.Store, r *agent.Runner) *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
+// pathID parses the {id} path param. On a non-numeric id it writes a 400 and
+// returns ok=false so callers early-return rather than hitting the store with a
+// silent 0 (which reads as a missing row).
+func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return 0, false
+	}
+	return id, true
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
@@ -133,8 +145,14 @@ func (s *Server) handleEnsureReview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]int64{"id": id})
 }
 
+// handleListComments serves GET /api/reviews/{id}/comments. The SPA hydrates
+// comments via listReviews instead, but this stays as deliberate, standalone
+// API surface for scripts/debugging.
 func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	comments, err := s.store.Comments(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -144,7 +162,10 @@ func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAddComment(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	var c store.Comment
 	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -168,7 +189,10 @@ type updateCommentReq struct {
 }
 
 func (s *Server) handleUpdateComment(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	var req updateCommentReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -196,7 +220,10 @@ func (s *Server) handleUpdateComment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	if err := s.store.DeleteComment(id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -211,7 +238,10 @@ type submitReviewReq struct {
 // handleSubmitReview marks the review's pending comments as submitted and kicks
 // off the agent run on that batch.
 func (s *Server) handleSubmitReview(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	var req submitReviewReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -267,7 +297,10 @@ func (s *Server) runReview(id int64, batch []store.Comment) {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return

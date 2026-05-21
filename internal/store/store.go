@@ -3,6 +3,7 @@ package store
 
 import (
 	"database/sql"
+	"sort"
 	"strings"
 	"time"
 
@@ -69,6 +70,9 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One connection serializes access to the single-file SQLite DB, avoiding
+	// SQLITE_BUSY under concurrent requests (this is a local single-user app).
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
@@ -166,29 +170,32 @@ func (s *Store) DeleteComment(id int64) error {
 }
 
 // MarkSubmitted flags every still-pending comment of a review as submitted and
-// collapsed, returning the comments that were affected by this call.
+// collapsed, returning exactly the comments that were affected by this call. The
+// flag and the read happen in one UPDATE ... RETURNING so a comment inserted
+// concurrently can't be marked submitted yet absent from the returned batch
+// (which would silently drop it from the agent run).
 func (s *Store) MarkSubmitted(reviewID int64) ([]Comment, error) {
-	pending, err := s.pendingComments(reviewID)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := s.db.Exec(
-		`UPDATE comments SET submitted = 1, collapsed = 1 WHERE review_id = ? AND submitted = 0`,
-		reviewID); err != nil {
-		return nil, err
-	}
-	return pending, nil
-}
-
-func (s *Store) pendingComments(reviewID int64) ([]Comment, error) {
 	rows, err := s.db.Query(
-		`SELECT id, review_id, path, side, line, blob_sha, body, submitted, collapsed FROM comments WHERE review_id = ? AND submitted = 0 ORDER BY path, line`,
+		`UPDATE comments SET submitted = 1, collapsed = 1 WHERE review_id = ? AND submitted = 0
+		 RETURNING id, review_id, path, side, line, blob_sha, body, submitted, collapsed`,
 		reviewID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return scanComments(rows)
+	out, err := scanComments(rows)
+	if err != nil {
+		return nil, err
+	}
+	// RETURNING gives no ordering guarantee; sort to match the rest of the API
+	// (and keep the agent prompt's comment order stable).
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		return out[i].Line < out[j].Line
+	})
+	return out, nil
 }
 
 func (s *Store) Comments(reviewID int64) ([]Comment, error) {
