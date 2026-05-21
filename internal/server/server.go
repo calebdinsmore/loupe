@@ -15,23 +15,26 @@ import (
 	"github.com/calebjdinsmore/loupe/internal/adapter"
 	"github.com/calebjdinsmore/loupe/internal/agent"
 	"github.com/calebjdinsmore/loupe/internal/git"
+	"github.com/calebjdinsmore/loupe/internal/prompts"
 	"github.com/calebjdinsmore/loupe/internal/store"
 )
 
 type Server struct {
-	git    *git.Service
-	store  *store.Store
-	runner *agent.Runner
-	mux    *chi.Mux
+	git     *git.Service
+	store   *store.Store
+	runner  *agent.Runner
+	prompts *prompts.Loader
+	mux     *chi.Mux
 
 	mu   sync.Mutex
 	hubs map[int64]*hub
 }
 
-func New(g *git.Service, st *store.Store, r *agent.Runner) *Server {
-	s := &Server{git: g, store: st, runner: r, hubs: map[int64]*hub{}}
+func New(g *git.Service, st *store.Store, r *agent.Runner, p *prompts.Loader) *Server {
+	s := &Server{git: g, store: st, runner: r, prompts: p, hubs: map[int64]*hub{}}
 	m := chi.NewRouter()
 	m.Get("/api/branches", s.handleBranches)
+	m.Get("/api/prompts", s.handlePrompts)
 	m.Get("/api/diff", s.handleDiff)
 	m.Get("/api/reviews", s.handleListReviews)
 	m.Post("/api/reviews", s.handleEnsureReview)
@@ -76,6 +79,34 @@ func (s *Server) handleBranches(w http.ResponseWriter, _ *http.Request) {
 		"base":     s.git.DefaultBase(),
 		"current":  s.git.CurrentBranch(),
 	})
+}
+
+// handlePrompts lists the available prompts and the globally-remembered
+// selection. The selection falls back to "document" (then the first prompt) when
+// last_prompt is unset or points at a prompt that no longer exists.
+func (s *Server) handlePrompts(w http.ResponseWriter, _ *http.Request) {
+	list, err := s.prompts.List()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	selected, _ := s.store.Setting("last_prompt")
+	if !containsID(list, selected) {
+		selected = "document"
+		if !containsID(list, selected) && len(list) > 0 {
+			selected = list[0].ID
+		}
+	}
+	writeJSON(w, map[string]any{"prompts": list, "selected": selected})
+}
+
+func containsID(list []prompts.Prompt, id string) bool {
+	for _, p := range list {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // diffFor returns the diff for a base/branch pair, dispatching to DiffWorking so
@@ -153,7 +184,7 @@ func (s *Server) handleEnsureReview(w http.ResponseWriter, r *http.Request) {
 	}
 	mode := req.Mode
 	if mode == "" {
-		mode = string(adapter.ModeDocument)
+		mode = "document"
 	}
 	id, err := s.store.EnsureReview(req.Branch, req.Base, mode)
 	if err != nil {
@@ -270,6 +301,10 @@ func (s *Server) handleSubmitReview(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if err := s.store.SetSetting("last_prompt", req.Mode); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	batch, err := s.store.MarkSubmitted(id)
 	if err != nil {
@@ -295,8 +330,14 @@ func (s *Server) runReview(id int64, batch []store.Comment) {
 	}
 	diff, _ := s.diffFor(rev.Base, rev.Branch)
 
-	prompt := adapter.BuildPrompt(rev, batch, diff)
-	tools := adapter.AllowedTools(adapter.Mode(rev.Mode))
+	task, err := s.prompts.Render(rev.Mode, prompts.Vars{ReviewID: rev.ID, Branch: rev.Branch, Base: rev.Base})
+	if err != nil {
+		h.broadcast(agent.Event{Type: agent.EventError, Text: err.Error()})
+		_ = s.store.SetStatus(id, "error")
+		return
+	}
+	prompt := adapter.BuildPrompt(rev, batch, diff, task)
+	tools := adapter.DefaultTools()
 
 	_ = s.store.SetStatus(id, "running")
 	events, err := s.runner.Run(context.Background(), prompt, tools, rev.SessionID)

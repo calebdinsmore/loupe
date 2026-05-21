@@ -41,7 +41,7 @@ func main() {
 	}
 	defer st.Close()
 
-	srv := server.New(git.New(root), st, agent.New(root))
+	srv := server.New(git.New(root), st, agent.New(root), prompts.New(root))
 
 	// LOUPE_ADDR pins the port for `vite dev` proxying; otherwise pick any free one.
 	addr := os.Getenv("LOUPE_ADDR")
