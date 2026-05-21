@@ -105,6 +105,14 @@ select, textarea, button {
 
 .badge { margin-left: 0.5rem; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.4px; color: #3fb950; border: 1px solid #234d32; border-radius: 999px; padding: 0.05rem 0.4rem; }
 
+/* Per-file home for comments whose anchored line no longer exists in the diff. */
+.outdated { margin: 0.25rem 0.75rem 0.75rem; border: 1px dashed var(--border); border-radius: 6px; background: #15110b; }
+.outdated > summary { cursor: pointer; padding: 0.4rem 0.6rem; font-size: 0.75rem; color: #d29922; list-style-position: inside; }
+.outdated-list { list-style: none; margin: 0; padding: 0.25rem 0.6rem 0.5rem; }
+.outdated-list li { display: flex; justify-content: space-between; gap: 0.75rem; align-items: flex-start; padding: 0.4rem 0; border-top: 1px dashed var(--border); }
+.outdated-list li:first-child { border-top: none; }
+.outdated .badge { color: #d29922; border-color: #5a4711; }
+
 .comment-row.submitted td { background: #0e1a12; border-left: 2px solid #234d32; }
 .comment-collapsed { width: 100%; text-align: left; background: transparent; border: none; color: var(--muted); cursor: pointer; padding: 0; }
 .comment-collapsed .show { margin-left: 0.5rem; color: var(--accent); font-size: 0.72rem; }

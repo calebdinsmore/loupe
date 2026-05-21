@@ -10,6 +10,7 @@ import {
   submitReview,
   updateComment,
 } from './api'
+import { relocate } from './anchor'
 import { parseUnifiedDiff, type DiffLine, type FileDiff } from './diff'
 import { appendEvent, type AgentEvent } from './events'
 import { highlightLine, langForPath } from './highlight'
@@ -28,6 +29,9 @@ interface Comment {
   path: string
   line: number
   side: string
+  // anchorText is the commented line's content at creation, used to relocate the
+  // comment when the diff drifts. Empty for legacy comments (treated as no anchor).
+  anchorText: string
   body: string
   submitted: boolean
   collapsed: boolean
@@ -38,6 +42,7 @@ interface Editor {
   path: string
   line: number
   side: string
+  anchorText: string
   id?: number
 }
 
@@ -107,6 +112,7 @@ export default function App() {
         path: c.path,
         line: c.line,
         side: c.side,
+        anchorText: c.anchor_text,
         body: c.body,
         submitted: c.submitted,
         collapsed: c.collapsed,
@@ -143,6 +149,30 @@ export default function App() {
     return m
   }, [files, comments])
 
+  // Resolve every comment against the freshly parsed diff. A comment whose stored
+  // line still matches (or relocates within the search window) renders inline at
+  // its current line; one that can't be placed is collected as orphaned so it can
+  // surface in the per-file "outdated comments" section instead of vanishing.
+  const located = useMemo(() => {
+    const byPath = new Map<string, { inline: Map<number, Comment[]>; orphaned: Comment[] }>()
+    for (const f of files) {
+      const entry = { inline: new Map<number, Comment[]>(), orphaned: [] as Comment[] }
+      for (const c of comments) {
+        if (c.path !== f.path) continue
+        const ln = relocate({ line: c.line, anchorText: c.anchorText }, f)
+        if (ln == null) {
+          entry.orphaned.push(c)
+        } else {
+          const arr = entry.inline.get(ln) ?? []
+          arr.push(c)
+          entry.inline.set(ln, arr)
+        }
+      }
+      byPath.set(f.path, entry)
+    }
+    return byPath
+  }, [files, comments])
+
   // Scroll-spy: highlight the file whose section is most prominently in view.
   useEffect(() => {
     const root = document.querySelector('.diff')
@@ -176,12 +206,14 @@ export default function App() {
 
   function openNew(path: string, line: DiffLine) {
     const ln = line.newLine ?? line.oldLine ?? 0
-    setEditor({ path, line: ln, side: line.kind === 'del' ? 'left' : 'right' })
+    // Capture the line's content as the anchor so the comment can relocate if the
+    // diff later shifts.
+    setEditor({ path, line: ln, side: line.kind === 'del' ? 'left' : 'right', anchorText: line.content })
     setDraft('')
   }
 
   function startEdit(c: Comment) {
-    setEditor({ path: c.path, line: c.line, side: c.side, id: c.id })
+    setEditor({ path: c.path, line: c.line, side: c.side, anchorText: c.anchorText, id: c.id })
     setDraft(c.body)
     jumpTo(c.path, c.line)
   }
@@ -210,10 +242,16 @@ export default function App() {
       )
     } else {
       const id = await ensureReviewId()
-      const created = await addComment(id, { path: target.path, side: target.side, line: target.line, body })
+      const created = await addComment(id, {
+        path: target.path,
+        side: target.side,
+        line: target.line,
+        anchor_text: target.anchorText,
+        body,
+      })
       setComments((cs) => [
         ...cs,
-        { id: created.id, path: created.path, line: created.line, side: created.side, body: created.body, submitted: created.submitted, collapsed: created.collapsed },
+        { id: created.id, path: created.path, line: created.line, side: created.side, anchorText: created.anchor_text, body: created.body, submitted: created.submitted, collapsed: created.collapsed },
       ])
     }
   }
@@ -276,16 +314,24 @@ export default function App() {
     ws.onclose = () => setRunning(false)
   }
 
+  // editorForm is the textarea + actions, reused both inline in the diff table
+  // (wrapped in a row) and standalone in the outdated-comments section.
+  function editorForm() {
+    return (
+      <>
+        <textarea autoFocus value={draft} placeholder="Leave a comment…" onChange={(e) => setDraft(e.target.value)} />
+        <div className="edit-actions">
+          <button onClick={saveEditor}>{editor?.id ? 'Save' : 'Add'}</button>
+          <button className="ghost" onClick={() => setEditor(null)}>Cancel</button>
+        </div>
+      </>
+    )
+  }
+
   function editorRow() {
     return (
       <tr className="comment-edit">
-        <td colSpan={3}>
-          <textarea autoFocus value={draft} placeholder="Leave a comment…" onChange={(e) => setDraft(e.target.value)} />
-          <div className="edit-actions">
-            <button onClick={saveEditor}>{editor?.id ? 'Save' : 'Add'}</button>
-            <button className="ghost" onClick={() => setEditor(null)}>Cancel</button>
-          </div>
-        </td>
+        <td colSpan={3}>{editorForm()}</td>
       </tr>
     )
   }
@@ -343,6 +389,8 @@ export default function App() {
           {files.length === 0 && <p className="empty">Pick a branch to review.</p>}
           {files.map((f) => {
             const lang = langForPath(f.path)
+            const loc = located.get(f.path)
+            const orphaned = loc?.orphaned ?? []
             return (
               <section key={f.path} id={fileId(f.path)} data-path={f.path} className={`file ${flash === fileId(f.path) ? 'flash' : ''}`}>
                 <div className="file-head">{f.path}</div>
@@ -356,7 +404,7 @@ export default function App() {
                         {h.lines.map((l, li) => {
                           const ln = l.newLine ?? l.oldLine ?? 0
                           const id = rowId(f.path, ln)
-                          const rowComments = comments.filter((c) => c.path === f.path && c.line === ln)
+                          const rowComments = loc?.inline.get(ln) ?? []
                           const editingHere = editor?.path === f.path && editor.line === ln
                           return (
                             <Fragment key={li}>
@@ -404,6 +452,33 @@ export default function App() {
                     ))}
                   </tbody>
                 </table>
+                {orphaned.length > 0 && (
+                  <details className="outdated">
+                    <summary>
+                      {orphaned.length} outdated comment{orphaned.length === 1 ? '' : 's'} · no longer match a line
+                    </summary>
+                    <ul className="outdated-list">
+                      {orphaned.map((c) => (
+                        <li key={c.id}>
+                          {editor?.id === c.id ? (
+                            editorForm()
+                          ) : (
+                            <>
+                              <div className="comment-body">
+                                💬 {c.body}
+                                <span className="badge">was line {c.line}</span>
+                              </div>
+                              <div className="comment-actions">
+                                <button onClick={() => startEdit(c)}>Edit</button>
+                                <button onClick={() => deleteComment(c.id)}>Delete</button>
+                              </div>
+                            </>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
               </section>
             )
           })}
