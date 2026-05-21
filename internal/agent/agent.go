@@ -22,6 +22,7 @@ const (
 	EventTool   EventType = "tool_use" // assistant invoked a tool
 	EventResult EventType = "result"   // terminal summary
 	EventError  EventType = "error"    // spawn/exit failure
+	EventUser   EventType = "user"     // user-authored turn; carries Text
 )
 
 type Event struct {

@@ -277,6 +277,114 @@ func TestSubmitMissingPromptBroadcastsError(t *testing.T) {
 	}
 }
 
+// TestSendMessageRequiresSession verifies a message before any agent session
+// exists is rejected (the resume run has nothing to continue).
+func TestSendMessageRequiresSession(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/message", `{"text":"hi"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("message with no session = %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestSendMessageEmptyReturns400 verifies whitespace-only text is rejected before
+// taking the busy slot.
+func TestSendMessageEmptyReturns400(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	if err := st.SetSession(rev, "sess-1"); err != nil {
+		t.Fatalf("SetSession: %v", err)
+	}
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/message", `{"text":"   "}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("empty message = %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestSendMessageBroadcastsUserEvent verifies a valid message broadcasts the
+// user-authored event first, before the resume run streams in. The agent CLI is
+// unavailable in tests, so we only assert on the synchronously-broadcast user
+// event, mirroring TestSubmitMissingPromptBroadcastsError.
+func TestSendMessageBroadcastsUserEvent(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	if err := st.SetSession(rev, "sess-1"); err != nil {
+		t.Fatalf("SetSession: %v", err)
+	}
+	ch := srv.hubFor(rev).subscribe()
+
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/message", `{"text":"please clarify"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("message = %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+
+	select {
+	case ev := <-ch:
+		if ev.Type != agent.EventUser {
+			t.Fatalf("first event = %q, want user", ev.Type)
+		}
+		if ev.Text != "please clarify" {
+			t.Fatalf("user event text = %q, want %q", ev.Text, "please clarify")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the user event")
+	}
+}
+
+// TestSendMessageBusyReturns409 verifies a second message is rejected while a turn
+// holds the slot. The first message takes the slot; the agent CLI is unavailable,
+// so the run will error out asynchronously, but the slot is held for the second
+// call placed immediately after.
+func TestSendMessageBusyReturns409(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	if err := st.SetSession(rev, "sess-1"); err != nil {
+		t.Fatalf("SetSession: %v", err)
+	}
+	// Hold the slot directly so the test does not race the async run's finish().
+	if !srv.hubFor(rev).tryStart() {
+		t.Fatal("could not acquire busy slot")
+	}
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/message", `{"text":"hi"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("message while busy = %d, want 409 (%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestSubmitBusyReturns409 verifies a submit is rejected while a turn holds the
+// slot, while the no-pending guard still 400s before the slot is consulted.
+func TestSubmitBusyReturns409(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	if _, err := st.AddComment(store.Comment{ReviewID: rev, Path: "a.go", Line: 1, Body: "x"}); err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+	// Hold the slot so the submit cannot acquire it.
+	if !srv.hubFor(rev).tryStart() {
+		t.Fatal("could not acquire busy slot")
+	}
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/submit", `{"mode":"document"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("submit while busy = %d, want 409 (%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestSubmitNoPendingBeforeBusy verifies the no-pending guard runs before the
+// busy slot is taken: even while a turn holds the slot, an empty submit 400s
+// rather than 409, so it never consumes or denies the slot.
+func TestSubmitNoPendingBeforeBusy(t *testing.T) {
+	srv, st := newTestServer(t)
+	rev, _ := st.CreateReview("feat", "main", "document")
+	if !srv.hubFor(rev).tryStart() {
+		t.Fatal("could not acquire busy slot")
+	}
+	w := do(t, srv, http.MethodPost, "/api/reviews/"+itoa(rev)+"/submit", `{"mode":"document"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("empty submit while busy = %d, want 400 (%s)", w.Code, w.Body.String())
+	}
+}
+
 // TestDiffWorkingRefRoutesToWorkingTree verifies the working-tree sentinel
 // routes /api/diff to DiffWorking: requesting branch=*working* surfaces an
 // uncommitted edit that the committed branch diff does not.
