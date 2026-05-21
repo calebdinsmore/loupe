@@ -9,6 +9,7 @@ import {
   listPrompts,
   listReviews,
   type PromptInfo,
+  sendMessage,
   submitReview,
   updateComment,
 } from './api'
@@ -65,6 +66,10 @@ export default function App() {
   const [events, setEvents] = useState<AgentEvent[]>([])
   const consoleRef = useRef<HTMLDivElement>(null)
   const [running, setRunning] = useState(false)
+  // hasSession gates the message input: a session exists once the first submit
+  // has produced one. Hydrated from the persisted review and set true on submit.
+  const [hasSession, setHasSession] = useState(false)
+  const [msgDraft, setMsgDraft] = useState('')
   const [flash, setFlash] = useState<string | null>(null)
   // Bumped by the Refresh button to re-pull the diff. Working-tree diffs are
   // live, so unlike committed branch diffs they can change without base/branch
@@ -84,6 +89,24 @@ export default function App() {
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
     if (nearBottom) el.scrollTop = el.scrollHeight
   }, [events])
+
+  // Persistent agent socket: open on review load (not just on submit) so the hub
+  // replays the full transcript on reload and live events from both submit and
+  // message runs stream into the same console. setEvents([]) here (not in submit)
+  // means a submit no longer wipes a transcript the socket is about to replay;
+  // the cleanup close also guards against React 18 StrictMode double-mount.
+  useEffect(() => {
+    if (reviewId == null) return
+    setEvents([])
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const ws = new WebSocket(`${proto}://${location.host}/api/reviews/${reviewId}/ws`)
+    ws.onmessage = (e) => {
+      const ev = JSON.parse(e.data) as AgentEvent
+      if (ev.type === 'result' || ev.type === 'error') setRunning(false)
+      setEvents((prev) => appendEvent(prev, ev))
+    }
+    return () => ws.close()
+  }, [reviewId])
 
   useEffect(() => {
     getBranches().then((info) => {
@@ -122,6 +145,7 @@ export default function App() {
     // reappear (collapsed/resolved) after a reload.
     setReviewId(null)
     setComments([])
+    setHasSession(false)
     ;(async () => {
       const id = await ensureReview(base, branch)
       if (cancelled) return
@@ -129,6 +153,7 @@ export default function App() {
       const reviews = await listReviews(base, branch)
       if (cancelled) return
       const rev = reviews.find((r) => r.ID === id)
+      setHasSession(!!rev?.SessionID)
       const hydrated = (rev?.comments ?? []).map((c) => ({
         id: c.id,
         path: c.path,
@@ -331,30 +356,41 @@ export default function App() {
   async function submit() {
     if (running || !pending.length) return
     setRunning(true)
-    setEvents([])
-    let id: number
     try {
-      // Resolve the review id and mark the batch submitted before opening the
-      // socket. If either rejects (e.g. a 400 "no pending comments"), surface it
-      // and bail — we must not open a WebSocket for a run that never started.
-      id = await ensureReviewId()
+      // Resolve the review id and mark the batch submitted. If either rejects
+      // (e.g. a 400 "no pending comments" or a 409 busy), surface it and bail.
+      // The persistent socket already carries the run's events, so there is no
+      // socket to open here.
+      const id = await ensureReviewId()
       await submitReview(id, mode)
     } catch (err) {
+      // A 409 (agent busy) and any other failure leave running cleared; the run
+      // never started, so the terminal event that would otherwise clear it will
+      // not arrive.
       setRunning(false)
-      setEvents([{ type: 'error', text: err instanceof Error ? err.message : String(err) }])
+      setEvents((prev) => [...prev, { type: 'error', text: err instanceof Error ? err.message : String(err) }])
       return
     }
-    // The server marked the pending batch submitted + collapsed; mirror that
-    // locally so the UI resolves them and the submit button gates correctly.
+    // A successful submit produces a session; enable the message input. The
+    // server marked the pending batch submitted + collapsed; mirror that locally
+    // so the UI resolves them and the submit button gates correctly.
+    setHasSession(true)
     setComments((cs) => cs.map((c) => (c.submitted ? c : { ...c, submitted: true, collapsed: true })))
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const ws = new WebSocket(`${proto}://${location.host}/api/reviews/${id}/ws`)
-    ws.onmessage = (e) => {
-      const ev = JSON.parse(e.data) as AgentEvent
-      if (ev.type === 'result' || ev.type === 'error') setRunning(false)
-      setEvents((prev) => appendEvent(prev, ev))
+  }
+
+  // sendMsg posts a follow-up turn. The backend broadcasts the user event over
+  // the socket, so it is not echoed locally (that would double on reload).
+  async function sendMsg() {
+    const text = msgDraft.trim()
+    if (!text || running || reviewId == null) return
+    setMsgDraft('')
+    setRunning(true)
+    try {
+      await sendMessage(reviewId, text)
+    } catch (err) {
+      setRunning(false)
+      setEvents((prev) => [...prev, { type: 'error', text: err instanceof Error ? err.message : String(err) }])
     }
-    ws.onclose = () => setRunning(false)
   }
 
   // editorForm is the textarea + actions, reused both inline in the diff table
@@ -568,11 +604,20 @@ export default function App() {
                   <div className="ev-ts">{formatClock(ev.ts)}</div>
                 )}
                 <div className={`ev ev-${ev.type}`}>
-                  {ev.type === 'tool_use' ? `⚙ ${ev.tool}` : ev.text}
+                  {ev.type === 'tool_use' ? `⚙ ${ev.tool}` : ev.type === 'user' ? `› ${ev.text}` : ev.text}
                 </div>
               </Fragment>
             ))}
           </div>
+          <form className="agent-input" onSubmit={(e) => { e.preventDefault(); sendMsg() }}>
+            <input
+              value={msgDraft}
+              onChange={(e) => setMsgDraft(e.target.value)}
+              placeholder={hasSession ? 'Message the agent…' : 'Submit a review to start a session'}
+              disabled={!hasSession || running}
+            />
+            <button type="submit" disabled={!hasSession || running || !msgDraft.trim()}>Send</button>
+          </form>
         </aside>
       </div>
     </div>

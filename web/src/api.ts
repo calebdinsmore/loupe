@@ -134,3 +134,16 @@ export async function submitReview(reviewId: number, mode: string): Promise<void
     }),
   )
 }
+
+// sendMessage posts a follow-up turn to the agent for an existing session. The
+// resulting user and reply events arrive over the review WebSocket, so callers
+// do not echo the text locally.
+export async function sendMessage(reviewId: number, text: string): Promise<void> {
+  return ok(
+    await fetch(`/api/reviews/${reviewId}/message`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ text }),
+    }),
+  )
+}
