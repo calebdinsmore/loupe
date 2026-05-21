@@ -1,4 +1,5 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
+import { FileTree, type FileMeta } from './FileTreePanel'
 import {
   addComment,
   deleteComment as apiDeleteComment,
@@ -41,6 +42,8 @@ interface Editor {
 }
 
 const rowId = (path: string, line: number) => `loc-${path.replace(/[^a-zA-Z0-9]/g, '_')}-${line}`
+// Stable scroll-target id for a file's <section>, used by the tree sidebar.
+const fileId = (path: string) => `file-${path.replace(/[^a-zA-Z0-9]/g, '_')}`
 
 export default function App() {
   const [branches, setBranches] = useState<string[]>([])
@@ -59,6 +62,10 @@ export default function App() {
   // live, so unlike committed branch diffs they can change without base/branch
   // changing.
   const [refreshKey, setRefreshKey] = useState(0)
+  // Left file-tree nav: whether the panel is collapsed to a rail, and which file
+  // is currently in view (scroll-spy highlight).
+  const [treeCollapsed, setTreeCollapsed] = useState(false)
+  const [activeFile, setActiveFile] = useState<string | null>(null)
 
   useEffect(() => {
     getBranches().then((info) => {
@@ -112,6 +119,60 @@ export default function App() {
   }, [base, branch])
 
   const pending = comments.filter((c) => !c.submitted)
+
+  const paths = useMemo(() => files.map((f) => f.path), [files])
+
+  // Per-file badge data for the tree: +/- line counts from the diff plus the
+  // count of pending comments anchored in each file.
+  const fileMeta = useMemo(() => {
+    const m: Record<string, FileMeta> = {}
+    for (const f of files) {
+      let add = 0
+      let del = 0
+      for (const h of f.hunks) {
+        for (const l of h.lines) {
+          if (l.kind === 'add') add++
+          else if (l.kind === 'del') del++
+        }
+      }
+      m[f.path] = { add, del, comments: 0 }
+    }
+    for (const c of comments) {
+      if (!c.submitted && m[c.path]) m[c.path].comments++
+    }
+    return m
+  }, [files, comments])
+
+  // Scroll-spy: highlight the file whose section is most prominently in view.
+  useEffect(() => {
+    const root = document.querySelector('.diff')
+    if (!root || files.length === 0) return
+    const sections = Array.from(root.querySelectorAll<HTMLElement>('section.file[data-path]'))
+    if (sections.length === 0) return
+    const ratios = new Map<string, number>()
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          const p = (e.target as HTMLElement).dataset.path
+          if (p) ratios.set(p, e.isIntersecting ? e.intersectionRatio : 0)
+        }
+        let best: string | null = null
+        let bestRatio = 0
+        for (const [p, r] of ratios) {
+          if (r > bestRatio) {
+            bestRatio = r
+            best = p
+          }
+        }
+        // Always assign (including null) so the highlight clears when every
+        // section has scrolled out of view rather than going stale.
+        setActiveFile(best)
+      },
+      { root, threshold: [0, 0.25, 0.5, 1] },
+    )
+    sections.forEach((s) => obs.observe(s))
+    return () => obs.disconnect()
+  }, [files])
 
   function openNew(path: string, line: DiffLine) {
     const ln = line.newLine ?? line.oldLine ?? 0
@@ -174,6 +235,14 @@ export default function App() {
   function jumpTo(path: string, line: number) {
     const id = rowId(path, line)
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    setFlash(id)
+    setTimeout(() => setFlash((f) => (f === id ? null : f)), 1200)
+  }
+
+  // Scroll the diff to a file's section header, reusing jumpTo's flash pattern.
+  function scrollToFile(path: string) {
+    const id = fileId(path)
+    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     setFlash(id)
     setTimeout(() => setFlash((f) => (f === id ? null : f)), 1200)
   }
@@ -252,13 +321,30 @@ export default function App() {
         </div>
       </header>
 
-      <div className="layout">
+      <div className={`layout ${treeCollapsed ? 'tree-collapsed' : ''}`}>
+        {treeCollapsed ? (
+          <div className="filetree-rail">
+            <button className="ft-toggle" onClick={() => setTreeCollapsed(false)} title="Show file tree">
+              ›
+            </button>
+          </div>
+        ) : (
+          <aside className="filetree-panel">
+            <div className="ft-head">
+              <span>Files</span>
+              <button className="ft-toggle" onClick={() => setTreeCollapsed(true)} title="Collapse file tree">
+                ‹
+              </button>
+            </div>
+            <FileTree paths={paths} activePath={activeFile} meta={fileMeta} onSelect={scrollToFile} />
+          </aside>
+        )}
         <main className="diff">
           {files.length === 0 && <p className="empty">Pick a branch to review.</p>}
           {files.map((f) => {
             const lang = langForPath(f.path)
             return (
-              <section key={f.path} className="file">
+              <section key={f.path} id={fileId(f.path)} data-path={f.path} className={`file ${flash === fileId(f.path) ? 'flash' : ''}`}>
                 <div className="file-head">{f.path}</div>
                 <table>
                   <tbody>
